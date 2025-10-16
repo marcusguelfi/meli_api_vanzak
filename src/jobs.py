@@ -3,62 +3,102 @@ from __future__ import annotations
 
 import os
 import json
+import csv
 import logging
 from datetime import datetime
 from typing import Any, Dict, List, Optional
-
 import requests
+from urllib.parse import urlencode, urlsplit, urlunsplit, parse_qsl
 
-from .meli_client import meli_get, write_csv
+from .meli_client import meli_get
 
-# -----------------------------------------------------------------------------
-# Config: envio para Google Apps Script (opcional)
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# Cabeçalhos e variáveis globais
+# ---------------------------------------------------------------------
+HDR_V1 = {"Api-Version": "1"}
+HDR_V2 = {"Api-Version": "2"}
+
 APPSCRIPT_URL = os.getenv("GOOGLE_APPSCRIPT_URL", "").strip()
-APPSCRIPT_TOKEN = os.getenv("GOOGLE_APPSCRIPT_TOKEN", "").strip()  # opcional
+APPSCRIPT_TOKEN = os.getenv("GOOGLE_APPSCRIPT_TOKEN", "").strip()
 
-
-def enviar_para_google_sheets(caminho_csv: str) -> None:
-    """
-    Envia o CSV gerado para o Apps Script (Web App) via POST.
-    Se GOOGLE_APPSCRIPT_URL não estiver definido, apenas loga e segue.
-    """
-    if not APPSCRIPT_URL:
-        logging.info("GOOGLE_APPSCRIPT_URL não configurado; pulando envio ao Apps Script.")
-        return
-
-    url = APPSCRIPT_URL
-    if APPSCRIPT_TOKEN:
-        sep = "&" if "?" in url else "?"
-        url = f"{url}{sep}token={APPSCRIPT_TOKEN}"
-
-    try:
-        with open(caminho_csv, "rb") as f:
-            resp = requests.post(url, data=f, timeout=60)
-        resp.raise_for_status()
-        logging.info(f"Apps Script OK: {resp.status_code} {resp.text[:160]}")
-    except Exception as e:
-        logging.exception(f"Falha ao enviar CSV para Apps Script: {e}")
-
-
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
 # Helpers
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
+def _ts_now() -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
 def save_json(data: Any, path: str) -> str:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     return path
 
+def write_csv(rows: List[Dict[str, Any]], base_name: str, folder: str = "data/processed") -> str:
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, f"{base_name}.csv")
 
-def _ts_now() -> str:
-    return datetime.now().strftime("%Y%m%d_%H%M%S")
+    fieldnames: List[str] = []
+    seen = set()
+    for r in rows:
+        for k in r.keys():
+            if k not in seen:
+                seen.add(k)
+                fieldnames.append(k)
 
+    file_exists = os.path.exists(path)
+    mode = "a" if file_exists else "w"
 
+    with open(path, mode, encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if not file_exists:
+            writer.writeheader()
+        for r in rows:
+            writer.writerow({k: r.get(k, "") for k in fieldnames})
+
+    logging.info(f"💾 CSV atualizado: {path}")
+    return path
+
+# ---------------------------------------------------------------------
+# Envio para Google Sheets via Apps Script
+# ---------------------------------------------------------------------
+def enviar_para_google_sheets(caminho_csv: str, sheet: Optional[str] = None) -> None:
+    """
+    Envia um CSV para o Apps Script WebApp configurado via .env (GOOGLE_APPSCRIPT_URL).
+    Cria a aba automaticamente se não existir.
+    """
+    if not APPSCRIPT_URL:
+        logging.warning("⚠️ GOOGLE_APPSCRIPT_URL não configurado. Pulando envio ao Google Sheets.")
+        return
+
+    q = dict(parse_qsl(urlsplit(APPSCRIPT_URL).query))
+    if APPSCRIPT_TOKEN:
+        q["token"] = APPSCRIPT_TOKEN
+    if sheet:
+        q["sheet"] = sheet
+    q["name"] = os.path.basename(caminho_csv)
+
+    parts = list(urlsplit(APPSCRIPT_URL))
+    parts[3] = urlencode(q)
+    url = urlunsplit(parts)
+
+    try:
+        headers = {
+            "Content-Type": "text/csv",
+            "X-Filename": os.path.basename(caminho_csv),
+        }
+        with open(caminho_csv, "rb") as f:
+            data = f.read()
+        logging.info(f"⬆️ Enviando {caminho_csv} → {url}")
+        resp = requests.post(url, data=data, headers=headers, timeout=120)
+        resp.raise_for_status()
+        logging.info(f"✅ Upload OK ({resp.status_code}) – {sheet or 'dados'} atualizado.")
+    except Exception as e:
+        logging.exception(f"❌ Falha ao enviar CSV para Apps Script: {e}")
+
+# ---------------------------------------------------------------------
+# Métricas básicas
+# ---------------------------------------------------------------------
 def _basic_metrics() -> List[str]:
-    """
-    Conjunto de métricas aceitas em search/ads e search/campaigns (sem impression_share e afins).
-    """
     return [
         "clicks", "prints", "ctr", "cost", "cpc", "acos",
         "organic_units_quantity", "organic_units_amount", "organic_items_quantity",
@@ -68,10 +108,9 @@ def _basic_metrics() -> List[str]:
         "direct_amount", "indirect_amount", "total_amount",
     ]
 
-
-# -----------------------------------------------------------------------------
-# Jobs “padrão” já existentes
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# Users / Orders
+# ---------------------------------------------------------------------
 def job_user_me() -> str:
     data = meli_get("/users/me")
     row = {
@@ -84,342 +123,66 @@ def job_user_me() -> str:
         "ts_local": datetime.now().isoformat(timespec="seconds"),
     }
     path = write_csv([row], "users_me")
-    enviar_para_google_sheets(path)
+    enviar_para_google_sheets(path, sheet="users_me")
     return path
 
-
 def job_orders_recent(seller_id: str, date_from_iso: Optional[str] = None) -> str:
-    params: Dict[str, Any] = {"seller": seller_id}
+    params = {"seller": seller_id}
     if date_from_iso:
         params["order.date_created.from"] = date_from_iso
 
     data = meli_get("/orders/search", params=params)
-    results = data.get("results", [])
-    rows: List[Dict[str, Any]] = []
-    for o in results:
-        rows.append({
+    rows = [
+        {
             "id": o.get("id"),
             "date_created": o.get("date_created"),
             "status": o.get("status"),
             "total_amount": o.get("total_amount"),
             "currency_id": o.get("currency_id"),
             "buyer_id": (o.get("buyer") or {}).get("id"),
-        })
-
+        }
+        for o in data.get("results", [])
+    ]
     path = write_csv(rows, "orders")
-    enviar_para_google_sheets(path)
+    enviar_para_google_sheets(path, sheet="orders")
     return path
 
-
-# -----------------------------------------------------------------------------
-# Product Ads — Advertiser
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# Product Ads — Advertiser / Campaigns / Ads
+# ---------------------------------------------------------------------
 def job_get_advertiser(product_id: str = "PADS") -> Dict[str, Any]:
-    """
-    Consulta o advertiser via /advertising/advertisers?product_id=PADS.
-    Salva JSON em data/processed/advertiser_*.json
-    """
-    params = {"product_id": product_id}
-    data = meli_get("/advertising/advertisers", params=params)
-    advs = data.get("advertisers", [])
-    if advs:
-        logging.info(f"✅ Advertiser encontrado: {advs[0]}")
-    else:
-        logging.warning("⚠️ Nenhum advertiser retornado.")
+    data = meli_get("/advertising/advertisers", params={"product_id": product_id}, headers=HDR_V1)
     save_json(data, f"data/processed/advertiser_{_ts_now()}.json")
     return data
 
-
-# -----------------------------------------------------------------------------
-# Product Ads — Campaigns (search)
-# -----------------------------------------------------------------------------
-def job_campaigns_summary(advertiser_id: str, site_id: str, date_from: str, date_to: str) -> str:
-    """
-    Métricas resumidas de campanhas (metrics_summary=true).
-    """
-    endpoint = f"/advertising/{site_id}/advertisers/{advertiser_id}/product_ads/campaigns/search"
-    params = {
-        "limit": 50,
-        "offset": 0,
-        "date_from": date_from,
-        "date_to": date_to,
-        "metrics": ",".join(_basic_metrics()),
-        "metrics_summary": "true",
-    }
-    data = meli_get(endpoint, params=params)
-    save_json(data, f"data/processed/campaigns_summary_{advertiser_id}_{_ts_now()}.json")
-
-    # Normalização simples: se vier metrics_summary, vira uma linha
-    rows: List[Dict[str, Any]] = []
-    if isinstance(data, dict) and "metrics_summary" in data:
-        row = {"advertiser_id": advertiser_id, "site_id": site_id}
-        for k, v in data["metrics_summary"].items():
-            if not isinstance(v, (list, dict)):
-                row[k] = v
-        rows.append(row)
-    else:
-        # fallback: joga payload em uma coluna
-        rows.append({"advertiser_id": advertiser_id, "site_id": site_id, "payload_json": json.dumps(data, ensure_ascii=False)})
-
-    path = write_csv(rows, f"campaigns_summary_{advertiser_id}")
-    logging.info(f"✅ Dados salvos em {path}")
-    enviar_para_google_sheets(path)
-    return path
-
-
 def job_campaigns_daily(advertiser_id: str, site_id: str, date_from: str, date_to: str) -> str:
-    """
-    Métricas diárias de campanhas (aggregation_type=DAILY).
-    """
     endpoint = f"/advertising/{site_id}/advertisers/{advertiser_id}/product_ads/campaigns/search"
     params = {
-        "limit": 50,
-        "offset": 0,
-        "date_from": date_from,
-        "date_to": date_to,
-        "metrics": ",".join(_basic_metrics()),
-        "aggregation_type": "DAILY",
+        "limit": 50, "offset": 0, "date_from": date_from, "date_to": date_to,
+        "metrics": ",".join(_basic_metrics()), "aggregation_type": "DAILY",
     }
-    data = meli_get(endpoint, params=params)
-    save_json(data, f"data/processed/campaigns_daily_{advertiser_id}_{_ts_now()}.json")
-
-    # Normalização: results (lista de dias/campanhas)
-    rows: List[Dict[str, Any]] = []
-    if isinstance(data, dict) and isinstance(data.get("results"), list):
-        for r in data["results"]:
-            base: Dict[str, Any] = {"advertiser_id": advertiser_id, "site_id": site_id}
-            if isinstance(r, dict):
-                for k, v in r.items():
-                    if not isinstance(v, (list, dict)):
-                        base[k] = v
-            rows.append(base)
-    else:
-        rows.append({"advertiser_id": advertiser_id, "site_id": site_id, "payload_json": json.dumps(data, ensure_ascii=False)})
-
+    data = meli_get(endpoint, params=params, headers=HDR_V2)
+    rows = [
+        {**r, "advertiser_id": advertiser_id, "site_id": site_id}
+        for r in data.get("results", [])
+        if isinstance(r, dict)
+    ]
     path = write_csv(rows, f"campaigns_daily_{advertiser_id}")
-    logging.info(f"✅ Dados salvos em {path}")
-    enviar_para_google_sheets(path)
+    enviar_para_google_sheets(path, sheet="campaigns_daily")
     return path
-
-
-# -----------------------------------------------------------------------------
-# Product Ads — Ads (search)
-# -----------------------------------------------------------------------------
-def job_ads_summary(advertiser_id: str, site_id: str, date_from: str, date_to: str) -> str:
-    """
-    Métricas de anúncios (resumo).
-    """
-    endpoint = f"/advertising/{site_id}/advertisers/{advertiser_id}/product_ads/ads/search"
-    params = {
-        "limit": 50,
-        "offset": 0,
-        "date_from": date_from,
-        "date_to": date_to,
-        "metrics": ",".join(_basic_metrics()),
-        "metrics_summary": "true",
-    }
-    data = meli_get(endpoint, params=params)
-    save_json(data, f"data/processed/ads_summary_{advertiser_id}_{_ts_now()}.json")
-
-    rows: List[Dict[str, Any]] = []
-    if isinstance(data, dict) and "metrics_summary" in data:
-        row = {"advertiser_id": advertiser_id, "site_id": site_id}
-        for k, v in data["metrics_summary"].items():
-            if not isinstance(v, (list, dict)):
-                row[k] = v
-        rows.append(row)
-    else:
-        rows.append({"advertiser_id": advertiser_id, "site_id": site_id, "payload_json": json.dumps(data, ensure_ascii=False)})
-
-    path = write_csv(rows, f"ads_summary_{advertiser_id}")
-    logging.info(f"✅ Dados salvos em {path}")
-    enviar_para_google_sheets(path)
-    return path
-
 
 def job_ads_daily(advertiser_id: str, site_id: str, date_from: str, date_to: str) -> str:
-    """
-    Métricas diárias de anúncios.
-    """
     endpoint = f"/advertising/{site_id}/advertisers/{advertiser_id}/product_ads/ads/search"
     params = {
-        "limit": 50,
-        "offset": 0,
-        "date_from": date_from,
-        "date_to": date_to,
-        "metrics": ",".join(_basic_metrics()),
-        "aggregation_type": "DAILY",
+        "limit": 50, "offset": 0, "date_from": date_from, "date_to": date_to,
+        "metrics": ",".join(_basic_metrics()), "aggregation_type": "DAILY",
     }
-    data = meli_get(endpoint, params=params)
-    save_json(data, f"data/processed/ads_daily_{advertiser_id}_{_ts_now()}.json")
-
-    rows: List[Dict[str, Any]] = []
-    if isinstance(data, dict) and isinstance(data.get("results"), list):
-        for r in data["results"]:
-            base: Dict[str, Any] = {"advertiser_id": advertiser_id, "site_id": site_id}
-            if isinstance(r, dict):
-                for k, v in r.items():
-                    if not isinstance(v, (list, dict)):
-                        base[k] = v
-            rows.append(base)
-    else:
-        rows.append({"advertiser_id": advertiser_id, "site_id": site_id, "payload_json": json.dumps(data, ensure_ascii=False)})
-
+    data = meli_get(endpoint, params=params, headers=HDR_V2)
+    rows = [
+        {**r, "advertiser_id": advertiser_id, "site_id": site_id}
+        for r in data.get("results", [])
+        if isinstance(r, dict)
+    ]
     path = write_csv(rows, f"ads_daily_{advertiser_id}")
-    logging.info(f"✅ Dados salvos em {path}")
-    enviar_para_google_sheets(path)
+    enviar_para_google_sheets(path, sheet="ads_daily")
     return path
-
-
-def job_list_ads_basic(advertiser_id: str, site_id: str, limit: int = 10, offset: int = 0) -> str:
-    """
-    Lista básica de anúncios (sem métricas) para capturar item_id/status etc.
-    """
-    endpoint = f"/advertising/{site_id}/advertisers/{advertiser_id}/product_ads/ads/search"
-    params = {
-        "limit": limit,
-        "offset": offset,
-    }
-    data = meli_get(endpoint, params=params)
-    results = data.get("results", [])
-    rows: List[Dict[str, Any]] = []
-
-    for idx, r in enumerate(results, start=1):
-        ad_id = r.get("ad_id") or r.get("id")
-        item_id = r.get("item_id") or r.get("id")  # dependendo do shape
-        status = r.get("status")
-        logging.info(f"• {idx}: ad_id={ad_id} item_id={item_id} status={status}")
-
-        rows.append({
-            "ad_id": ad_id,
-            "item_id": item_id,
-            "status": status,
-        })
-
-    logging.info(f"✅ {len(rows)} anúncios retornados")
-    path = write_csv(rows, f"ads_list_{advertiser_id}")
-    save_json(data, f"data/processed/ads_list_{advertiser_id}_{_ts_now()}.json")
-    logging.info(f"📝 Lista salva em {path}")
-    enviar_para_google_sheets(path)
-    return path
-
-
-# -----------------------------------------------------------------------------
-# Product Ads — Item detail & metrics (com fallback ads → items)
-# -----------------------------------------------------------------------------
-def job_item_detail(site_id: str, item_id: str) -> str:
-    """
-    Detalhe de um anúncio por item_id.
-    Tenta primeiro /product_ads/ads/{item_id} e faz fallback para /product_ads/items/{item_id}.
-    """
-    try_order = [
-        f"/advertising/{site_id}/product_ads/ads/{item_id}",
-        f"/advertising/{site_id}/product_ads/items/{item_id}",
-    ]
-
-    last_err: Optional[Exception] = None
-    for ep in try_order:
-        try:
-            logging.info(f"➡️ GET {ep}")
-            data = meli_get(ep)
-            rows = []
-            if isinstance(data, dict):
-                flat = {k: v for k, v in data.items() if not isinstance(v, (list, dict))}
-                flat["item_id"] = item_id
-                rows.append(flat)
-            else:
-                rows.append({"item_id": item_id, "payload_json": json.dumps(data, ensure_ascii=False)})
-
-            csv_path = write_csv(rows, f"item_detail_{item_id}")
-            save_json(data, f"data/processed/item_detail_{item_id}_{_ts_now()}.json")
-            logging.info(f"✅ Detalhe salvo em {csv_path}")
-            enviar_para_google_sheets(csv_path)
-            return csv_path
-
-        except requests.HTTPError as e:
-            status = getattr(e.response, "status_code", None)
-            body = ""
-            try:
-                body = e.response.text
-            except Exception:
-                pass
-            logging.error(f"❌ Erro {status} ao chamar https://api.mercadolibre.com{ep}: {body}")
-            last_err = e
-            if status == 404:
-                continue
-            break
-        except Exception as e:
-            logging.exception(f"❌ Erro inesperado no detalhe do item {item_id} em {ep}: {e}")
-            last_err = e
-            break
-
-    raise last_err or RuntimeError(f"Falha ao buscar detalhe do item {item_id}")
-
-
-def job_item_metrics(site_id: str, item_id: str, date_from: str, date_to: str, aggregation_type: Optional[str] = None) -> str:
-    """
-    Métricas de um anúncio por item_id.
-    Tenta ADS e depois ITEMS. Remove métricas proibidas (impression_share e similares).
-    """
-    metrics = _basic_metrics()
-    params: Dict[str, Any] = {
-        "date_from": date_from,
-        "date_to": date_to,
-        "metrics": ",".join(metrics),
-    }
-    if aggregation_type:
-        params["aggregation_type"] = aggregation_type  # e.g. "DAILY"
-
-    try_order = [
-        f"/advertising/{site_id}/product_ads/ads/{item_id}",
-        f"/advertising/{site_id}/product_ads/items/{item_id}",
-    ]
-
-    last_err: Optional[Exception] = None
-    for ep in try_order:
-        try:
-            logging.info(f"➡️ GET {ep} (params={params})")
-            data = meli_get(ep, params=params)
-
-            rows: List[Dict[str, Any]] = []
-            if isinstance(data, dict) and "metrics_summary" in data:
-                row = {"item_id": item_id}
-                for k, v in data["metrics_summary"].items():
-                    if not isinstance(v, (list, dict)):
-                        row[k] = v
-                rows.append(row)
-            elif isinstance(data, dict) and isinstance(data.get("results"), list):
-                for r in data["results"]:
-                    base: Dict[str, Any] = {"item_id": item_id}
-                    if isinstance(r, dict):
-                        for k, v in r.items():
-                            if not isinstance(v, (list, dict)):
-                                base[k] = v
-                    rows.append(base)
-            else:
-                rows.append({"item_id": item_id, "payload_json": json.dumps(data, ensure_ascii=False)})
-
-            csv_path = write_csv(rows, f"item_metrics_{item_id}")
-            save_json(data, f"data/processed/item_metrics_{item_id}_{_ts_now()}.json")
-            logging.info(f"✅ Métricas do item salvas em {csv_path}")
-            enviar_para_google_sheets(csv_path)
-            return csv_path
-
-        except requests.HTTPError as e:
-            status = getattr(e.response, "status_code", None)
-            body = ""
-            try:
-                body = e.response.text
-            except Exception:
-                pass
-            logging.error(f"❌ Erro {status} ao chamar https://api.mercadolibre.com{ep}: {body}")
-            last_err = e
-            if status == 404:
-                continue
-            break
-        except Exception as e:
-            logging.exception(f"❌ Erro inesperado ao buscar métricas do item {item_id} em {ep}: {e}")
-            last_err = e
-            break
-
-    raise last_err or RuntimeError(f"Falha ao obter métricas para item {item_id}")
