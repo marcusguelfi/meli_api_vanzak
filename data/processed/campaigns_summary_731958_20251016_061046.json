@@ -1,0 +1,70 @@
+{
+  "paging": {
+    "offset": 0,
+    "total": 1,
+    "limit": 50
+  },
+  "results": [
+    {
+      "id": 353235970,
+      "name": "VNZK01_PRODUCT-ADS_PERF",
+      "status": "active",
+      "last_updated": "2025-10-16T06:31:01.000Z",
+      "date_created": "2025-06-30T17:30:03.000Z",
+      "strategy": "PROFITABILITY",
+      "acos_target": 20.0,
+      "acos_top_search_target": 0.0,
+      "channel": "marketplace",
+      "advertiser_id": 731958,
+      "salesforce_event_id": 14,
+      "budget": 650.0,
+      "automatic_budget": false,
+      "metrics": {
+        "clicks": 3060,
+        "prints": 1621962,
+        "cost": 7247.03,
+        "cpc": 2.37,
+        "ctr": 0.19,
+        "direct_amount": 26740.65,
+        "indirect_amount": 11717.6,
+        "total_amount": 38458.25,
+        "direct_units_quantity": 68,
+        "indirect_units_quantity": 36,
+        "units_quantity": 104,
+        "direct_items_quantity": 64,
+        "indirect_items_quantity": 32,
+        "advertising_items_quantity": 96,
+        "organic_units_quantity": 99,
+        "organic_units_amount": 31458.0,
+        "organic_items_quantity": 88,
+        "acos": 18.84,
+        "cvr": 3.4,
+        "roas": 5.31,
+        "sov": 52.17
+      }
+    }
+  ],
+  "metrics_summary": {
+    "clicks": 3060,
+    "prints": 1621962,
+    "cost": 7247.03,
+    "cpc": 2.37,
+    "ctr": 0.19,
+    "direct_amount": 26740.65,
+    "indirect_amount": 11717.6,
+    "total_amount": 38458.25,
+    "direct_units_quantity": 68,
+    "indirect_units_quantity": 36,
+    "units_quantity": 104,
+    "direct_items_quantity": 64,
+    "indirect_items_quantity": 32,
+    "advertising_items_quantity": 96,
+    "organic_units_quantity": 99,
+    "organic_units_amount": 31458.0,
+    "organic_items_quantity": 88,
+    "acos": 18.84,
+    "cvr": 3.4,
+    "roas": 5.31,
+    "sov": 52.17
+  }
+}
