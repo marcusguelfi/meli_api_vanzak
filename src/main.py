@@ -1,74 +1,122 @@
-import argparse, logging, os
-from logging.handlers import RotatingFileHandler
-from apscheduler.schedulers.blocking import BlockingScheduler
-import pytz
+import argparse
+import logging
+import sys
+from datetime import datetime
 
-from .auth import build_authorize_url, exchange_code_for_token
-from .jobs import job_user_me, job_orders_recent
-from .config import LOG_DIR, ML_SELLER_ID
+# Importações locais
+from src.auth import (
+    get_auth_url,
+    exchange_code_for_token,
+    refresh_token,
+    get_access_token,
+)
+from src.jobs import (
+    job_get_advertiser,
+    job_campaigns_summary,
+    job_campaigns_daily,
+    job_ads_summary,
+    job_ads_daily,
+)
 
-def setup_logging():
-    os.makedirs(LOG_DIR, exist_ok=True)
-    log_path = os.path.join(LOG_DIR, "pipeline.log")
-    handler = RotatingFileHandler(log_path, maxBytes=2_000_000, backupCount=3, encoding="utf-8")
-    logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s %(levelname)s %(message)s",
-                        handlers=[handler, logging.StreamHandler()])
+# Configuração de logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
 
-def run_once():
-    p1 = job_user_me()
-    logging.info(f"users_me CSV -> {p1}")
-    if ML_SELLER_ID:
-        p2 = job_orders_recent(ML_SELLER_ID)
-        logging.info(f"orders CSV -> {p2}")
-    else:
-        logging.info("ML_SELLER_ID não definido; pulando job de orders.")
-
-def schedule_hourly():
-    tz = pytz.timezone("America/Sao_Paulo")
-    sched = BlockingScheduler(timezone=tz)
-    # executa já e depois a cada hora
-    run_once()
-    sched.add_job(run_once, "cron", minute=0)  # minuto 0 de toda hora
-    logging.info("Agendado para rodar de hora em hora (minuto 0).")
-    try:
-        sched.start()
-    except (KeyboardInterrupt, SystemExit):
-        logging.info("Encerrando scheduler.")
+# ==============================================================
+# CLI PRINCIPAL
+# ==============================================================
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--print-auth-url", action="store_true",
-                        help="Mostra a URL de autorização OAuth.")
-    parser.add_argument("--auth-code", type=str,
-                        help="Troca o authorization code por tokens e salva localmente.")
-    parser.add_argument("--run-once", action="store_true",
-                        help="Executa uma coleta única (sem scheduler).")
-    parser.add_argument("--schedule-hourly", action="store_true",
-                        help="Roda continuamente com agendamento horário.")
+    parser = argparse.ArgumentParser(
+        description="🚀 Cliente de integração com a API de Product Ads do Mercado Livre."
+    )
+
+    parser.add_argument("--auth-url", action="store_true", help="Gera a URL de autenticação para obter o authorization_code.")
+    parser.add_argument("--auth-code", type=str, help="Troca o authorization_code por tokens e salva localmente.")
+    parser.add_argument("--refresh", action="store_true", help="Atualiza o access_token usando o refresh_token.")
+    parser.add_argument("--job", type=str, help="Executa um job específico (ex: advertiser, campaigns_summary, ads_daily).")
+    parser.add_argument("--advertiser-id", type=str, default="731958", help="ID do advertiser (padrão: 731958).")
+    parser.add_argument("--site-id", type=str, default="MLB", help="Site ID (padrão: MLB).")
+    parser.add_argument("--from-date", type=str, default="2025-10-01", help="Data inicial no formato YYYY-MM-DD.")
+    parser.add_argument("--to-date", type=str, default="2025-10-15", help="Data final no formato YYYY-MM-DD.")
+
     args = parser.parse_args()
 
-    setup_logging()
-
-    if args.print_auth_url:
-        url = build_authorize_url()
-        print("\nAutorize aqui:\n", url, "\n")
+    # ==========================================================
+    # 1️⃣ Geração do link de autenticação
+    # ==========================================================
+    if args.auth_url:
+        url = get_auth_url()
+        print(f"\n🔗 Acesse este link para autorizar o app:\n{url}\n")
         return
 
+    # ==========================================================
+    # 2️⃣ Troca de authorization_code por tokens
+    # ==========================================================
     if args.auth_code:
-        tokens = exchange_code_for_token(args.auth_code)
-        logging.info(f"Tokens salvos. user_id={tokens.get('user_id')}")
+        logging.info("🔐 Solicitando troca de authorization_code por tokens...")
+        try:
+            tokens = exchange_code_for_token(args.auth_code)
+            logging.info(f"✅ Tokens obtidos e salvos com sucesso! user_id={tokens.get('user_id')}")
+        except Exception as e:
+            logging.error(f"❌ Falha ao trocar código: {e}")
         return
 
-    if args.run_once:
-        run_once()
+    # ==========================================================
+    # 3️⃣ Atualizar token manualmente
+    # ==========================================================
+    if args.refresh:
+        logging.info("🔄 Atualizando access_token manualmente...")
+        try:
+            new_tokens = refresh_token()
+            logging.info("✅ Token atualizado com sucesso!")
+            logging.info(f"Novo access_token: {new_tokens.get('access_token')[:20]}...")
+        except Exception as e:
+            logging.error(f"❌ Falha ao atualizar token: {e}")
         return
 
-    if args.schedule_hourly:
-        schedule_hourly()
+    # ==========================================================
+    # 4️⃣ Executar um job
+    # ==========================================================
+    if args.job:
+        job = args.job.lower()
+        advertiser_id = args.advertiser_id
+        site_id = args.site_id
+        date_from = args.from_date
+        date_to = args.to_date
+
+        logging.info(f"🚀 Executando job '{job}' ({site_id}/{advertiser_id}) de {date_from} a {date_to}")
+
+        try:
+            if job == "advertiser":
+                job_get_advertiser()
+            elif job == "campaigns_summary":
+                job_campaigns_summary(advertiser_id, site_id, date_from, date_to)
+            elif job == "campaigns_daily":
+                job_campaigns_daily(advertiser_id, site_id, date_from, date_to)
+            elif job == "ads_summary":
+                job_ads_summary(advertiser_id, site_id, date_from, date_to)
+            elif job == "ads_daily":
+                job_ads_daily(advertiser_id, site_id, date_from, date_to)
+            else:
+                logging.error(f"❌ Job '{job}' não reconhecido.")
+        except Exception as e:
+            logging.error(f"❌ Erro ao executar job '{job}': {e}")
         return
 
+    # ==========================================================
+    # 5️⃣ Nenhum argumento → mostra ajuda
+    # ==========================================================
     parser.print_help()
 
+
+# ==============================================================
+# ENTRYPOINT
+# ==============================================================
+
 if __name__ == "__main__":
+    logging.info("🚀 Iniciando cliente Mercado Livre Product Ads")
     main()
