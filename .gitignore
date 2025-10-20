@@ -4,3 +4,6 @@
 __pycache__/
 data/logs/*
 token_store.json
+# Credenciais e tokens locais
+tokens.json
+ads_store.json
