@@ -4,8 +4,9 @@ from __future__ import annotations
 import csv
 import os
 import logging
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+from urllib.parse import urlencode, urlsplit, urlunsplit, parse_qsl
 
 import requests
 
@@ -22,39 +23,69 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # -----------------------------------------------------------------------------
-# API headers / limites / paths
+# Headers & Config
 # -----------------------------------------------------------------------------
-# Para Product Ads (search/ads, search/campaigns, items)
+HDR_V1 = {"Api-Version": "1"}  # não usamos aqui, mas deixo por consistência
 HDR_V2 = {"Api-Version": "2"}
 
-# Janela máxima ~3 meses
-BACKFILL_MAX_DAYS = 90
-
 DATA_DIR = "data/processed"
-CAMPAIGNS_DAILY_CSV = os.path.join(DATA_DIR, "campaigns_daily.csv")
-ADS_DAILY_CSV = os.path.join(DATA_DIR, "ads_daily.csv")
-ORDERS_ITEMS_DAILY_CSV = os.path.join(DATA_DIR, "orders_items_daily.csv")
+
+# Apps Script (opcional)
+APPSCRIPT_URL = os.getenv("GOOGLE_APPSCRIPT_URL", "").strip()
+APPSCRIPT_TOKEN = os.getenv("GOOGLE_APPSCRIPT_TOKEN", "").strip()
+
+def _send_to_sheets(caminho_csv: str, sheet: Optional[str] = None) -> None:
+    """Envia CSV para Google Sheets via Apps Script (se configurado)."""
+    if not APPSCRIPT_URL:
+        return
+    q = dict(parse_qsl(urlsplit(APPSCRIPT_URL).query))
+    if APPSCRIPT_TOKEN:
+        q["token"] = APPSCRIPT_TOKEN
+    if sheet:
+        q["sheet"] = sheet
+    q["name"] = os.path.basename(caminho_csv)
+    parts = list(urlsplit(APPSCRIPT_URL))
+    parts[3] = urlencode(q)
+    url = urlunsplit(parts)
+    try:
+        headers = {
+            "Content-Type": "text/csv",
+            "X-Filename": os.path.basename(caminho_csv),
+        }
+        with open(caminho_csv, "rb") as f:
+            data = f.read()
+        logging.info(f"⬆️ Enviando {caminho_csv} → {url}")
+        resp = requests.post(url, data=data, headers=headers, timeout=120)
+        resp.raise_for_status()
+        logging.info(f"✅ Upload OK ({resp.status_code}) – {sheet or 'dados'} atualizado.")
+    except Exception as e:
+        logging.exception(f"❌ Falha ao enviar CSV para Apps Script: {e}")
 
 # -----------------------------------------------------------------------------
-# Helpers de data
+# Constantes
+# -----------------------------------------------------------------------------
+# Janela máxima de backfill: ~90 dias (limite usual da API)
+BACKFILL_MAX_DAYS = 90
+
+# -----------------------------------------------------------------------------
+# Helpers de datas
 # -----------------------------------------------------------------------------
 def _today() -> datetime:
     return datetime.now()
 
-def _iso(d: datetime | date) -> str:
-    if isinstance(d, date) and not isinstance(d, datetime):
-        d = datetime(d.year, d.month, d.day)
+def _iso(d: datetime) -> str:
     return d.strftime("%Y-%m-%d")
 
-def _clamp_to_3_months(start_date_str: str) -> Tuple[str, str]:
+def _clamp_to_3_months(start_date_str: str, end_inclusive: Optional[datetime] = None) -> Tuple[str, str]:
     """
-    Garante que o intervalo [start, hoje] respeite no máximo BACKFILL_MAX_DAYS.
+    Garante que o intervalo [start, end] respeite no máximo BACKFILL_MAX_DAYS.
     """
-    today = _today().date()
-    hard_min = today - timedelta(days=BACKFILL_MAX_DAYS - 1)
+    if end_inclusive is None:
+        end_inclusive = _today()
+    hard_min = end_inclusive.date() - timedelta(days=BACKFILL_MAX_DAYS - 1)
     req_start = datetime.strptime(start_date_str, "%Y-%m-%d").date()
     start = max(req_start, hard_min)
-    end = today
+    end = end_inclusive.date()
     return (start.isoformat(), end.isoformat())
 
 def _iter_chunks(start_iso: str, end_iso: str, chunk_days: int) -> Iterable[Tuple[str, str]]:
@@ -69,33 +100,43 @@ def _iter_chunks(start_iso: str, end_iso: str, chunk_days: int) -> Iterable[Tupl
         yield (cur.isoformat(), b.isoformat())
         cur = b + timedelta(days=1)
 
-def _day_bounds_iso(d: date | str) -> Tuple[str, str]:
-    """
-    Constrói intervalos RFC3339 (00:00:00.000Z – 23:59:59.999Z) para /orders/search.
-    """
-    if isinstance(d, str):
-        d = datetime.strptime(d, "%Y-%m-%d").date()
-    start = f"{d.isoformat()}T00:00:00.000-00:00"
-    end   = f"{d.isoformat()}T23:59:59.999-00:00"
-    return start, end
-
 # -----------------------------------------------------------------------------
-# Helpers de CSV c/ upsert
+# CSV helpers com upsert por (date_key, id_key)
 # -----------------------------------------------------------------------------
 def _ensure_dir(path: str) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
 
 def _guess_date_key(row: Dict[str, Any]) -> Optional[str]:
-    for k in ("date", "day", "period", "date_from"):
-        if k in row and row[k] not in (None, ""):
+    for k in ("date", "day", "period", "date_from", "date_created"):
+        if k in row and row[k]:
             return k
     return None
 
 def _guess_id_key(row: Dict[str, Any]) -> Optional[str]:
-    for k in ("ad_id", "campaign_id", "item_id", "id"):
+    for k in ("campaign_id", "ad_id", "item_id", "id"):
         if k in row and row[k] not in (None, ""):
             return k
     return None
+
+def _flatten_dicts(data: Any) -> List[Dict[str, Any]]:
+    """
+    Recebe payload de /search (results ou metrics_summary) e devolve linhas planas.
+    """
+    rows: List[Dict[str, Any]] = []
+    if isinstance(data, dict) and isinstance(data.get("results"), list):
+        for r in data["results"]:
+            if isinstance(r, dict):
+                flat = {k: v for k, v in r.items() if not isinstance(v, (list, dict))}
+                rows.append(flat)
+    elif isinstance(data, dict) and "metrics_summary" in data:
+        ms = data["metrics_summary"]
+        if isinstance(ms, dict):
+            flat = {k: v for k, v in ms.items() if not isinstance(v, (list, dict))}
+            rows.append(flat)
+    elif isinstance(data, dict):
+        flat = {k: v for k, v in data.items() if not isinstance(v, (list, dict))}
+        rows.append(flat)
+    return rows
 
 def _collect_fieldnames(existing: List[Dict[str, Any]], incoming: List[Dict[str, Any]]) -> List[str]:
     fieldnames: List[str] = []
@@ -132,7 +173,7 @@ def _save_csv(path: str, rows: List[Dict[str, Any]]) -> None:
 
 def _upsert_rows(path: str, new_rows: List[Dict[str, Any]]) -> None:
     """
-    Upsert por (date_key, id_key). Se não achar chaves, agrega.
+    Upsert por (date_key, id_key). Se não achar, apenas agrega.
     """
     existing = _load_csv(path)
     if not new_rows:
@@ -140,6 +181,7 @@ def _upsert_rows(path: str, new_rows: List[Dict[str, Any]]) -> None:
         logger.info(f"💾 CSV atualizado (sem novidades): {path}")
         return
 
+    # índice existente
     index: Dict[Tuple[str, str], int] = {}
     for i, r in enumerate(existing):
         dk = _guess_date_key(r)
@@ -147,6 +189,7 @@ def _upsert_rows(path: str, new_rows: List[Dict[str, Any]]) -> None:
         if dk and ik and r.get(dk) and r.get(ik):
             index[(str(r[dk]), str(r[ik]))] = i
 
+    # upsert
     for nr in new_rows:
         dk = _guess_date_key(nr)
         ik = _guess_id_key(nr)
@@ -165,7 +208,7 @@ def _upsert_rows(path: str, new_rows: List[Dict[str, Any]]) -> None:
     logger.info(f"💾 CSV atualizado: {path}")
 
 # -----------------------------------------------------------------------------
-# Métricas para /search (sem impression_share/bench)
+# Métricas básicas (compatíveis com /search)
 # -----------------------------------------------------------------------------
 def _basic_metrics() -> List[str]:
     return [
@@ -178,184 +221,39 @@ def _basic_metrics() -> List[str]:
     ]
 
 # -----------------------------------------------------------------------------
-# Flatteners (preservam TODOS os campos brutos com prefixos)
-# -----------------------------------------------------------------------------
-def _flat_simple(d: Dict[str, Any], prefix: str = "") -> Dict[str, Any]:
-    """
-    Achata apenas o primeiro nível. Dicts aninhados viram prefixo__chave.
-    """
-    out: Dict[str, Any] = {}
-    for k, v in d.items():
-        if isinstance(v, dict):
-            for k2, v2 in v.items():
-                out[f"{prefix}{k}__{k2}"] = v2
-        else:
-            out[f"{prefix}{k}"] = v
-    return out
-
-def _flatten_search_payload(data: Any, day: str) -> List[Dict[str, Any]]:
-    """
-    Para endpoints /search de Product Ads.
-    - Cada linha vem de results[i].
-    - Mantém TODOS os campos brutos com prefixos (campaign__, ad__, item__, etc).
-    - Adiciona colunas utilitárias: advertiser_id/site_id quando disponíveis e a 'date'.
-    """
-    rows: List[Dict[str, Any]] = []
-    if not isinstance(data, dict):
-        return rows
-
-    base: Dict[str, Any] = {}
-    # às vezes vêm no payload de topo
-    for top in ("advertiser_id", "site_id"):
-        if top in data:
-            base[top] = data[top]
-
-    results = data.get("results", [])
-    if isinstance(results, list):
-        for r in results:
-            if not isinstance(r, dict):
-                continue
-            flat = {}
-            for k, v in r.items():
-                if isinstance(v, dict):
-                    # sub-objetos (ex.: campaign, ad, item)
-                    for kk, vv in v.items():
-                        flat[f"{k}__{kk}"] = vv
-                else:
-                    flat[k] = v
-            # sobrepõe dados de topo
-            row = {**base, **flat}
-            row["date"] = day  # importante pro upsert
-            rows.append(row)
-
-    # às vezes retorna metrics_summary sem results (não é o caso do DAILY)
-    if not rows and "metrics_summary" in data and isinstance(data["metrics_summary"], dict):
-        flat = _flat_simple(data["metrics_summary"])
-        row = {**base, **flat}
-        row["date"] = day
-        rows.append(row)
-
-    return rows
-
-def _flatten_orders_day(payload: Dict[str, Any], the_day: str) -> List[Dict[str, Any]]:
-    """
-    Achata /orders/search para um dia, criando 1 linha por item vendido.
-    Mantém o máximo de campos brutos relevantes.
-    """
-    out: List[Dict[str, Any]] = []
-    results = payload.get("results", [])
-    if not isinstance(results, list):
-        return out
-
-    for order in results:
-        if not isinstance(order, dict):
-            continue
-
-        order_flat = _flat_simple(order, prefix="order__")
-        order_id = order.get("id")
-        # items
-        for it in (order.get("order_items") or []):
-            item_flat = _flat_simple(it, prefix="order_item__")
-            # payments (pega o primeiro como referência; preserva contagem)
-            pays = order.get("payments") or []
-            pay_flat: Dict[str, Any] = {"payments__count": len(pays)}
-            if pays and isinstance(pays[0], dict):
-                for k, v in pays[0].items():
-                    pay_flat[f"payments__0__{k}"] = v
-
-            row = {
-                "date": the_day,
-                "order_id": order_id,
-                **order_flat,
-                **item_flat,
-                **pay_flat,
-            }
-
-            # aliases úteis (ID / título / sku)
-            row.setdefault("item_id", it.get("item", {}).get("id") if isinstance(it.get("item"), dict) else it.get("item", ""))
-            row.setdefault("item_title", (it.get("item", {}) or {}).get("title") if isinstance(it.get("item"), dict) else "")
-            row.setdefault("seller_sku",
-                           (it.get("item", {}) or {}).get("seller_custom_field")
-                           if isinstance(it.get("item"), dict) else "")
-
-            out.append(row)
-
-    return out
-
-# -----------------------------------------------------------------------------
-# Aliases "bonitinhos" para o Sheets
-# -----------------------------------------------------------------------------
-def _aliases_ads(rows: List[Dict[str, Any]]) -> None:
-    for r in rows:
-        r["ad_id"]         = r.get("ad_id")         or r.get("ad__id") or r.get("id")
-        r["item_id"]       = r.get("item_id")       or r.get("item__id")
-        r["item_title"]    = r.get("item_title")    or r.get("item__title") or r.get("title")
-        r["seller_sku"]    = r.get("seller_sku")    or r.get("item__seller_sku") \
-                                               or r.get("item__seller_custom_field") \
-                                               or r.get("item__seller_sku_id")
-        r["campaign_id"]   = r.get("campaign_id")   or r.get("campaign__id")
-        r["campaign_name"] = r.get("campaign_name") or r.get("campaign__name") or r.get("name")
-        r["status"]        = r.get("status")        or r.get("ad__status") or r.get("item__status")
-
-def _aliases_campaigns(rows: List[Dict[str, Any]]) -> None:
-    for r in rows:
-        r["campaign_id"]   = r.get("campaign_id")   or r.get("campaign__id") or r.get("id")
-        r["campaign_name"] = r.get("campaign_name") or r.get("campaign__name") or r.get("name")
-        r["status"]        = r.get("status")        or r.get("campaign__status") or r.get("status")
-
-def _aliases_orders_items(rows: List[Dict[str, Any]]) -> None:
-    for r in rows:
-        r["item_id"]    = r.get("item_id")    or r.get("order_item__item__id") or r.get("id")
-        r["item_title"] = r.get("item_title") or r.get("order_item__item__title") or r.get("title")
-        r["seller_sku"] = r.get("seller_sku") or r.get("order_item__item__seller_custom_field") \
-                                           or r.get("order_item__item__seller_sku") \
-                                           or r.get("variation_sku")
-
-# -----------------------------------------------------------------------------
-# Backfills Product Ads (DAILY)
+# BACKFILL: Product Ads (Campaigns / Ads) – diárias
 # -----------------------------------------------------------------------------
 def backfill_campaigns_daily(advertiser_id: str, site_id: str, start_date: str, chunk_days: int = 30) -> None:
     """
-    Product Ads — campaigns DAILY. Upsert em campaigns_daily.csv
+    Busca dados diários de campanhas desde 'start_date' até HOJE (máx. 90d) e faz upsert em
+    data/processed/campaigns_daily_<advertiser_id>.csv
     """
     start_iso, end_iso = _clamp_to_3_months(start_date)
-    out_csv = CAMPAIGNS_DAILY_CSV
+    out_csv = os.path.join(DATA_DIR, f"campaigns_daily_{advertiser_id}.csv")
     logger.info(f"🧮 Backfill CAMPAIGNS daily | {start_iso} → {end_iso} (máx {BACKFILL_MAX_DAYS}d)")
 
     endpoint = f"/advertising/{site_id}/advertisers/{advertiser_id}/product_ads/campaigns/search"
 
     for a, b in _iter_chunks(start_iso, end_iso, chunk_days):
-        logger.info(f"🧭 campaigns_daily {a} → {b}")
         params = {
-            "limit": 50,
-            "offset": 0,
-            "date_from": a,
-            "date_to": b,
+            "limit": 50, "offset": 0,
+            "date_from": a, "date_to": b,
             "metrics": ",".join(_basic_metrics()),
             "aggregation_type": "DAILY",
         }
+        logger.info(f"🧭 campaigns_daily {a} → {b}")
         try:
             data = meli_get(endpoint, params=params, headers=HDR_V2)
-            rows = []
-            # o /search DAILY retorna vários dias; queremos uma linha por dia
-            for r in _flatten_search_payload(data, day=a):
-                # se tiver campo 'date' na própria linha (algumas APIs devolvem), respeite
-                if "date" not in r or not r["date"]:
-                    r["date"] = a
-                r["advertiser_id"] = advertiser_id
-                r["site_id"] = site_id
-                rows.append(r)
-
-            # aliases úteis
-            _aliases_campaigns(rows)
-
+            rows = _flatten_dicts(data)
             if not rows:
                 logger.info(f"⚠️ Sem dados para {a} → {b}")
                 continue
-
             _ensure_dir(out_csv)
+            # adiciona colunas fixas
+            for r in rows:
+                r.setdefault("advertiser_id", advertiser_id)
+                r.setdefault("site_id", site_id)
             _upsert_rows(out_csv, rows)
-
         except requests.HTTPError as e:
             code = getattr(e.response, "status_code", None)
             if code == 404:
@@ -367,46 +265,38 @@ def backfill_campaigns_daily(advertiser_id: str, site_id: str, start_date: str, 
             logger.exception(f"❌ Erro inesperado em campaigns {a} → {b}: {e}")
             raise
 
+    _send_to_sheets(out_csv, sheet="campaigns_daily")
+
 def backfill_ads_daily(advertiser_id: str, site_id: str, start_date: str, chunk_days: int = 30) -> None:
     """
-    Product Ads — ads DAILY. Upsert em ads_daily.csv
+    Busca dados diários de anúncios desde 'start_date' até HOJE (máx. 90d) e faz upsert em
+    data/processed/ads_daily_<advertiser_id>.csv
     """
     start_iso, end_iso = _clamp_to_3_months(start_date)
-    out_csv = ADS_DAILY_CSV
+    out_csv = os.path.join(DATA_DIR, f"ads_daily_{advertiser_id}.csv")
     logger.info(f"🧮 Backfill ADS daily | {start_iso} → {end_iso} (máx {BACKFILL_MAX_DAYS}d)")
 
     endpoint = f"/advertising/{site_id}/advertisers/{advertiser_id}/product_ads/ads/search"
 
     for a, b in _iter_chunks(start_iso, end_iso, chunk_days):
-        logger.info(f"🧭 ads_daily {a} → {b}")
         params = {
-            "limit": 50,
-            "offset": 0,
-            "date_from": a,
-            "date_to": b,
+            "limit": 50, "offset": 0,
+            "date_from": a, "date_to": b,
             "metrics": ",".join(_basic_metrics()),
             "aggregation_type": "DAILY",
         }
+        logger.info(f"🧭 ads_daily {a} → {b}")
         try:
             data = meli_get(endpoint, params=params, headers=HDR_V2)
-            rows = []
-            for r in _flatten_search_payload(data, day=a):
-                if "date" not in r or not r["date"]:
-                    r["date"] = a
-                r["advertiser_id"] = advertiser_id
-                r["site_id"] = site_id
-                rows.append(r)
-
-            # aliases úteis (id/título/sku/campaign)
-            _aliases_ads(rows)
-
+            rows = _flatten_dicts(data)
             if not rows:
                 logger.info(f"⚠️ Sem dados para {a} → {b}")
                 continue
-
             _ensure_dir(out_csv)
+            for r in rows:
+                r.setdefault("advertiser_id", advertiser_id)
+                r.setdefault("site_id", site_id)
             _upsert_rows(out_csv, rows)
-
         except requests.HTTPError as e:
             code = getattr(e.response, "status_code", None)
             if code == 404:
@@ -418,48 +308,136 @@ def backfill_ads_daily(advertiser_id: str, site_id: str, start_date: str, chunk_
             logger.exception(f"❌ Erro inesperado em ads {a} → {b}: {e}")
             raise
 
+    _send_to_sheets(out_csv, sheet="ads_daily")
+
 # -----------------------------------------------------------------------------
-# Backfill Orders por item/dia (1 linha por item vendido por dia)
+# BACKFILL: Orders por item — diário (até ONTEM)
 # -----------------------------------------------------------------------------
+def _date_only(iso_ts: str) -> str:
+    # pega AAAA-MM-DD de um ISO timestamp
+    try:
+        return iso_ts[:10]
+    except Exception:
+        return iso_ts
+
+def _enrich_items_titles(item_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+    """
+    Busca detalhes básicos de /items/{id} para obter title, catalog_listing, official_store_id etc.
+    Retorna dict por item_id.
+    """
+    out: Dict[str, Dict[str, Any]] = {}
+    for iid in item_ids:
+        try:
+            data = meli_get(f"/items/{iid}")  # endpoint público
+            out[iid] = {
+                "item_id": iid,
+                "title": data.get("title"),
+                "category_id": data.get("category_id"),
+                "domain_id": data.get("domain_id"),
+                "official_store_id": data.get("official_store_id"),
+                "catalog_listing": data.get("catalog_listing"),
+                "seller_id": (data.get("seller_id") or data.get("seller", {}).get("id")),
+                "permalink": data.get("permalink"),
+            }
+        except Exception:
+            logger.exception(f"⚠️ Falha ao enriquecer item {iid}")
+    return out
+
 def backfill_orders_items_daily(seller_id: str, start_date: str) -> None:
     """
-    Orders → 1 linha por item/dia (agrega todos os campos brutos possíveis).
-    Upsert em orders_items_daily.csv
+    Agrega pedidos por item, por dia, desde 'start_date' até ONTEM (máx. 90d).
+    Gera/atualiza:
+      - data/processed/orders_items_daily.csv (linhas diárias por item)
+      - data/processed/items_catalog.csv      (atributos do item)
     """
-    start_iso, end_iso = _clamp_to_3_months(start_date)
-    out_csv = ORDERS_ITEMS_DAILY_CSV
+    # limite até ontem (conforme pedido)
+    end_inclusive = datetime.now() - timedelta(days=1)
+    start_iso, end_iso = _clamp_to_3_months(start_date, end_inclusive=end_inclusive)
+
+    out_orders_csv = os.path.join(DATA_DIR, "orders_items_daily.csv")
+    out_items_csv = os.path.join(DATA_DIR, "items_catalog.csv")
+
     logger.info(f"🧮 Backfill ORDERS items daily | {start_iso} → {end_iso} (máx {BACKFILL_MAX_DAYS}d)")
 
+    # Itera dia a dia (agregação por dia + item)
     cur = datetime.strptime(start_iso, "%Y-%m-%d").date()
-    last = datetime.strptime(end_iso, "%Y-%m-%d").date()
+    end = datetime.strptime(end_iso, "%Y-%m-%d").date()
 
-    while cur <= last:
-        a_rfc, b_rfc = _day_bounds_iso(cur)
-        logger.info(f"🧭 orders_items_daily {cur.isoformat()}")
+    all_rows: List[Dict[str, Any]] = []
+    all_item_ids: set[str] = set()
+
+    while cur <= end:
+        a = cur.isoformat()
+        b = cur.isoformat()
+        logger.info(f"🧭 orders_items_daily {a}")
+
         params = {
             "seller": seller_id,
-            "order.date_created.from": a_rfc,
-            "order.date_created.to": b_rfc,
+            "order.date_created.from": f"{a}T00:00:00.000Z",
+            "order.date_created.to":   f"{b}T23:59:59.999Z",
         }
         try:
             data = meli_get("/orders/search", params=params)
-            rows = _flatten_orders_day(data, the_day=cur.isoformat())
-            _aliases_orders_items(rows)
-
-            if not rows:
-                logger.info(f"⚠️ Sem pedidos no dia {cur.isoformat()}")
-                cur += timedelta(days=1)
-                continue
-
-            _ensure_dir(out_csv)
-            _upsert_rows(out_csv, rows)
-
         except requests.HTTPError as e:
             code = getattr(e.response, "status_code", None)
-            logger.exception(f"❌ HTTP {code} ao buscar pedidos {cur.isoformat()}")
+            logger.error(f"❌ HTTP {code} ao buscar pedidos {a}")
             raise
         except Exception as e:
-            logger.exception(f"❌ Erro inesperado em pedidos {cur.isoformat()}: {e}")
+            logger.exception(f"❌ Erro inesperado ao buscar pedidos {a}: {e}")
             raise
 
-        cur += timedelta(days=1)
+        # agregação por item nesse dia
+        per_item: Dict[str, Dict[str, Any]] = {}
+
+        for o in data.get("results", []):
+            # data do pedido
+            day = _date_only(o.get("date_created", a))
+            order_status = o.get("status")
+            currency_id = o.get("currency_id")
+            total_amount = o.get("total_amount")
+
+            items = o.get("order_items") or []
+            if not isinstance(items, list):
+                items = []
+
+            for it in items:
+                item = it.get("item") or {}
+                iid = item.get("id") or item.get("seller_sku") or "UNKNOWN"
+                qty = it.get("quantity") or 0
+                unit_price = it.get("unit_price") or 0
+                price = qty * unit_price
+
+                row = per_item.setdefault(iid, {
+                    "date": day,
+                    "item_id": iid,
+                    "units": 0,
+                    "amount": 0.0,
+                    "currency_id": currency_id,
+                })
+                row["units"] = (row.get("units") or 0) + qty
+                row["amount"] = float(row.get("amount") or 0) + float(price or 0)
+
+                all_item_ids.add(iid)
+
+        all_rows.extend(per_item.values())
+        cur = cur + timedelta(days=1)
+
+    # upsert no CSV consolidado
+    _ensure_dir(out_orders_csv)
+    _upsert_rows(out_orders_csv, all_rows)
+    _send_to_sheets(out_orders_csv, sheet="orders_items_daily")
+
+    # enriquecer itens (título/sku/etc) e gravar catálogo
+    # carrega catálogo atual para evitar refetch de itens já conhecidos
+    existing_catalog = _load_csv(out_items_csv)
+    known_ids = {r.get("item_id") for r in existing_catalog if r.get("item_id")}
+    to_fetch = [iid for iid in all_item_ids if iid and iid not in known_ids and iid != "UNKNOWN"]
+
+    if to_fetch:
+        logger.info(f"🔎 Enriquecendo {len(to_fetch)} itens via /items/{{id}} …")
+        enriched = list(_enrich_items_titles(to_fetch).values())
+        # upsert por item_id (usa _upsert_rows – a chave será item_id; date_key inexistente → agrega/merge)
+        _ensure_dir(out_items_csv)
+        _upsert_rows(out_items_csv, enriched)
+
+    _send_to_sheets(out_items_csv, sheet="items_catalog")

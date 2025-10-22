@@ -1,0 +1,2 @@
+id       , name                   , status, last_updated            , date_created            , strategy     , acos_target, acos_top_search_target, channel    , advertiser_id, salesforce_event_id, budget, automatic_budget, campaign_id, campaign_name          , campaign_status
+353235970, VNZK01_PRODUCT-ADS_PERF, active, 2025-10-17T08:20:57.000Z, 2025-06-30T17:30:03.000Z, PROFITABILITY,        20.0,                    0.0, marketplace,        731958,                  14,  650.0, False           ,   353235970, VNZK01_PRODUCT-ADS_PERF, active
