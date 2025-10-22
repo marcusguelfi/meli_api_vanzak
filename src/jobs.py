@@ -3,12 +3,12 @@ from __future__ import annotations
 
 import os
 import csv
-import json
 import shutil
 import tempfile
 import logging
 from typing import Any, Dict, List, Optional, Iterable, Tuple
 from datetime import date, datetime, timedelta
+from collections import defaultdict
 
 import requests
 
@@ -28,9 +28,18 @@ APPSCRIPT_TOKEN = os.getenv("GOOGLE_APPSCRIPT_TOKEN", "").strip()
 
 DATA_DIR = "data/processed"
 
+# ordem “fixa” no cabeçalho; o restante vai depois em ordem alfabética
+PRIMARY_COL_ORDER = [
+    "advertiser_id", "site_id",
+    "date",
+    "campaign_id", "campaign_name",
+    "ad_id",
+    "item_id", "item_title", "seller_sku",
+    "status",
+]
 
 # ---------------------------------------------------------------------
-# util
+# utils
 # ---------------------------------------------------------------------
 def _ts() -> str:
     return datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -53,7 +62,8 @@ def _write_atomic(path: str, header: List[str], rows: Iterable[Dict[str, Any]]) 
     _ensure_dir(path)
     fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path) + "_", suffix=".tmp")
     os.close(fd)
-    with open(tmp, "w", encoding="utf-8", newline="") as f:
+    # newline="\n" evita linhas em branco quando o Apps Script lê
+    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
         w = csv.DictWriter(f, fieldnames=header)
         w.writeheader()
         for row in rows:
@@ -62,15 +72,14 @@ def _write_atomic(path: str, header: List[str], rows: Iterable[Dict[str, Any]]) 
     return path
 
 
-def _union_header(existing_header: List[str], new_rows: List[Dict[str, Any]]) -> List[str]:
-    order = list(existing_header)
-    seen = set(order)
-    for r in new_rows:
-        for k in r.keys():
-            if k not in seen:
-                seen.add(k)
-                order.append(k)
-    return order
+def _stable_header_from_rows(existing_header: List[str], rows: List[Dict[str, Any]]) -> List[str]:
+    keys = set(existing_header)
+    for r in rows:
+        keys.update(r.keys())
+    header: List[str] = [c for c in PRIMARY_COL_ORDER if c in keys]
+    remaining = sorted(k for k in keys if k not in header and k)
+    header.extend(remaining)
+    return header
 
 
 def write_csv_upsert_flexible(path: str, new_rows: List[Dict[str, Any]], key_fields: Tuple[str, ...]) -> str:
@@ -91,7 +100,7 @@ def write_csv_upsert_flexible(path: str, new_rows: List[Dict[str, Any]], key_fie
             index[k] = len(merged)
             merged.append(r)
 
-    header = _union_header(header_old, merged)
+    header = _stable_header_from_rows(header_old, merged)
     _write_atomic(path, header, merged)
     log.info(f"💾 CSV (upsert): {path} (+{len(new_rows)} linhas novas/atualizadas)")
     return path
@@ -122,14 +131,13 @@ def enviar_para_google_sheets(caminho_csv: str, sheet: Optional[str] = None) -> 
             resp = requests.post(
                 url,
                 data=f.read(),
-                headers={"Content-Type": "text/csv", "X-Filename": name},
+                headers={"Content-Type": "text/csv; charset=utf-8", "X-Filename": name},
                 timeout=120,
             )
         resp.raise_for_status()
         log.info(f"✅ Upload OK ({resp.status_code}) – aba {sheet or 'dados'}")
     except Exception as e:
         log.exception(f"❌ Falha no upload ao Apps Script: {e}")
-
 
 # ---------------------------------------------------------------------
 # chamadas meli (paginadas)
@@ -140,6 +148,9 @@ def search_all(endpoint: str, params: Dict[str, Any], headers: Dict[str, str]) -
     offset = 0
     while True:
         page = meli_get(endpoint, params={**params, "limit": limit, "offset": offset}, headers=headers)
+        if not isinstance(page, dict):
+            log.warning("⚠️ Resposta não-JSON em %s (offset=%s). Encerrando paginação.", endpoint, offset)
+            break
         batch = page.get("results", []) or []
         out.extend(batch)
         if len(batch) < limit:
@@ -147,16 +158,10 @@ def search_all(endpoint: str, params: Dict[str, Any], headers: Dict[str, str]) -
         offset += limit
     return out
 
-
 # ---------------------------------------------------------------------
-# flatten “cru”: copia todas as chaves simples e adiciona IDs/nome
+# flatten “cru”
 # ---------------------------------------------------------------------
 def _flatten_raw_daily(r: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Mantém nomes originais das métricas e adiciona chaves convenientes:
-    campaign_id/name, ad_id, item_id, item_title, seller_sku, status, date.
-    Compatível com payloads diários (aggregation_type=DAILY), que às vezes não incluem IDs.
-    """
     out: Dict[str, Any] = {}
 
     for k, v in r.items():
@@ -185,126 +190,326 @@ def _with_meta(row: Dict[str, Any], advertiser_id: str, site_id: str) -> Dict[st
     row["site_id"] = site_id
     return row
 
-
 # ---------------------------------------------------------------------
-# helpers de enriquecimento (join com summary local)
+# helpers de dimensão/enriquecimento
 # ---------------------------------------------------------------------
-def _load_campaign_name_to_id(advertiser_id: str) -> Dict[str, str]:
-    """
-    Lê campaign_summary_<advertiser_id>.csv e retorna {nome_lower: id}.
-    """
+def _load_campaign_dim(advertiser_id: str) -> Dict[str, Dict[str, str]]:
     path = os.path.join(DATA_DIR, f"campaign_summary_{advertiser_id}.csv")
     _, rows = _read_csv(path)
-    mapping: Dict[str, str] = {}
+    dim: Dict[str, Dict[str, str]] = {}
     for r in rows:
-        # o summary pode ter "campaign_id" ou "id" dependendo do schema salvo
         cid = str(r.get("campaign_id") or r.get("id") or "").strip()
         name = str(r.get("campaign_name") or r.get("name") or "").strip()
-        if cid and name:
-            mapping[name.lower()] = cid
-    return mapping
+        if cid:
+            dim[cid] = {"name": name}
+    return dim
 
+
+def _load_ads_dim_maps(advertiser_id: str) -> Tuple[Dict[str, Dict[str, str]], Dict[str, Dict[str, str]]]:
+    """
+    Retorna dois mapas:
+      - por item_id
+      - por ad_id
+    Cada meta inclui: ad_id, item_id, campaign_id, item_title, seller_sku, status
+    """
+    path = os.path.join(DATA_DIR, f"ads_summary_{advertiser_id}.csv")
+    _, rows = _read_csv(path)
+    by_item: Dict[str, Dict[str, str]] = {}
+    by_ad: Dict[str, Dict[str, str]] = {}
+    for r in rows:
+        item_id = str(r.get("item_id") or "").strip()
+        ad_id = str(r.get("ad_id") or "").strip()
+        campaign_id = str(r.get("campaign_id") or "").strip()
+        item_title = str(r.get("item_title") or r.get("title") or "").strip()
+        seller_sku = str(r.get("seller_sku") or "").strip()
+        status = str(r.get("status") or "").strip()
+        meta = {
+            "ad_id": ad_id,
+            "item_id": item_id,
+            "campaign_id": campaign_id,
+            "item_title": item_title,
+            "seller_sku": seller_sku,
+            "status": status,
+        }
+        if item_id:
+            by_item[item_id] = meta
+        if ad_id:
+            by_ad[ad_id] = meta
+    return by_item, by_ad
+
+
+_campaign_name_cache: Dict[str, str] = {}
+
+
+def _fetch_campaign_name(site_id: str, campaign_id: str) -> Optional[str]:
+    if not campaign_id:
+        return None
+    if campaign_id in _campaign_name_cache:
+        return _campaign_name_cache[campaign_id]
+    try:
+        path = f"/advertising/{site_id}/product_ads/campaigns/{campaign_id}"
+        resp = meli_get(path, headers=HDR_V2)
+        name = None
+        if isinstance(resp, dict):
+            name = (
+                resp.get("name")
+                or resp.get("campaign", {}).get("name")
+                or resp.get("data", {}).get("name")
+            )
+        if name:
+            name = str(name)
+            _campaign_name_cache[campaign_id] = name
+            return name
+    except Exception as e:
+        log.debug(f"⚠️ Falha ao buscar nome da campanha {campaign_id}: {e}")
+    return None
 
 # ---------------------------------------------------------------------
-# JOBS — daily (métricas) + summary
+# JOBS — daily + summary
 # ---------------------------------------------------------------------
 def job_campaigns_daily(advertiser_id: str, site_id: str, date_from: str, date_to: str) -> str:
-    """
-    campaigns_daily: métricas diárias agregadas POR CAMPANHA (aggregation_type=DAILY),
-    enriquecidas com campaign_id via campaign_summary local quando necessário.
-    """
-    endpoint = f"/advertising/{site_id}/advertisers/{advertiser_id}/product_ads/campaigns/search"
-    params = {
-        "date_from": date_from,
-        "date_to": date_to,
-        "metrics": ",".join([
-            "clicks","prints","cost","cpc","acos",
-            "organic_units_quantity","organic_units_amount","organic_items_quantity",
-            "direct_items_quantity","indirect_items_quantity","advertising_items_quantity",
-            "cvr","roas","sov",
-            "direct_units_quantity","indirect_units_quantity","units_quantity",
-            "direct_amount","indirect_amount","total_amount",
-        ]),
-        "aggregation_type": "DAILY",
-        "limit": 200,
-        "offset": 0,
-    }
-    # mapeia name->id do summary (se existir)
-    name_to_id = _load_campaign_name_to_id(advertiser_id)
+    base_endpoint = f"/advertising/{site_id}/advertisers/{advertiser_id}/product_ads/campaigns/search"
 
-    raw = search_all(endpoint, params, HDR_V2)
+    dim = _load_campaign_dim(advertiser_id)
+    if not dim:
+        log.info("ℹ️ campaign dimension vazia — executando job_campaigns_summary para preencher…")
+        job_campaigns_summary(advertiser_id, site_id)
+        dim = _load_campaign_dim(advertiser_id)
+
+    if not dim:
+        log.warning("⚠️ Sem campanhas no summary; abortando campaign_daily.")
+        return os.path.join(DATA_DIR, f"campaign_daily_{advertiser_id}.csv")
+
+    ids = list(dim.keys())
+    CHUNK = 50
 
     rows: List[Dict[str, Any]] = []
-    for r in raw:
-        if not isinstance(r, dict):
-            continue
-        flat = _flatten_raw_daily(r)
+    enriched, total = 0, 0
 
-        # se não veio campaign_id, tenta resolver pelo nome
-        if not flat.get("campaign_id") and flat.get("campaign_name"):
-            cid = name_to_id.get(str(flat["campaign_name"]).lower())
+    for i in range(0, len(ids), CHUNK):
+        chunk = ids[i:i + CHUNK]
+        params = {
+            "date_from": date_from,
+            "date_to": date_to,
+            "metrics": ",".join([
+                "clicks","prints","cost","cpc","acos",
+                "organic_units_quantity","organic_units_amount","organic_items_quantity",
+                "direct_items_quantity","indirect_items_quantity","advertising_items_quantity",
+                "cvr","roas","sov",
+                "direct_units_quantity","indirect_units_quantity","units_quantity",
+                "direct_amount","indirect_amount","total_amount",
+            ]),
+            "aggregation_type": "DAILY",
+            "limit": 200,
+            "offset": 0,
+            "filters[campaign_ids]": ",".join(chunk),
+        }
+
+        page = meli_get(base_endpoint, params=params, headers=HDR_V2)
+        data_results = page.get("results", []) if isinstance(page, dict) else (page or [])
+        for r in data_results:
+            if not isinstance(r, dict):
+                continue
+            flat = _flatten_raw_daily(r)
+            if not flat.get("date"):
+                continue
+
+            cid = str(flat.get("campaign_id") or "").strip()
+            cname = str(flat.get("campaign_name") or "").strip()
+
+            if not cid and len(chunk) == 1:
+                cid = chunk[0]
+
+            if cid and not cname:
+                cname = dim.get(cid, {}).get("name") or _fetch_campaign_name(site_id, cid) or cname
+
             if cid:
-                flat["campaign_id"] = cid
-                log.debug(f"↔️ campaign_id preenchido via summary: {flat['campaign_name']} → {cid}")
+                enriched += 1
 
-        # precisa ter data; campaign_id é desejável, mas se não tiver, ainda salvamos (para join posterior)
-        if not flat.get("date"):
-            continue
+            flat["campaign_id"] = cid or flat.get("campaign_id")
+            flat["campaign_name"] = cname or flat.get("campaign_name")
 
-        rows.append(_with_meta(flat, advertiser_id, site_id))
+            rows.append(_with_meta(flat, advertiser_id, site_id))
+            total += 1
 
     out_path = os.path.join(DATA_DIR, f"campaign_daily_{advertiser_id}.csv")
     write_csv_upsert_flexible(out_path, rows, key_fields=("advertiser_id", "campaign_id", "date"))
+    log.info(f"📌 campaign_daily: {enriched}/{total} linhas com campaign_id garantido (via filtro/lookup).")
     enviar_para_google_sheets(out_path, sheet="campaign_daily")
     return out_path
 
 
 def job_ads_daily(advertiser_id: str, site_id: str, date_from: str, date_to: str) -> str:
     """
-    ads_daily: métricas diárias agregadas POR ANÚNCIO (aggregation_type=DAILY),
-    enriquecidas ao máximo com chaves disponíveis (campaign_id via campaign_name quando possível).
+    Enriquecimento do DAILY por ad_id (prioridade) + fallback por item_id,
+    trazendo item_title, seller_sku, status e ids coerentes.
     """
-    endpoint = f"/advertising/{site_id}/advertisers/{advertiser_id}/product_ads/ads/search"
-    params = {
-        "date_from": date_from,
-        "date_to": date_to,
-        "metrics": ",".join([
-            "clicks","prints","cost","cpc","acos",
-            "organic_units_quantity","organic_units_amount","organic_items_quantity",
-            "direct_items_quantity","indirect_items_quantity","advertising_items_quantity",
-            "cvr","roas","sov",
-            "direct_units_quantity","indirect_units_quantity","units_quantity",
-            "direct_amount","indirect_amount","total_amount",
-        ]),
-        "aggregation_type": "DAILY",
-        "limit": 200,
-        "offset": 0,
-    }
-    name_to_id = _load_campaign_name_to_id(advertiser_id)
+    base_endpoint = f"/advertising/{site_id}/advertisers/{advertiser_id}/product_ads/ads/search"
 
-    raw = search_all(endpoint, params, HDR_V2)
+    by_item, by_ad = _load_ads_dim_maps(advertiser_id)
+    campaign_dim = _load_campaign_dim(advertiser_id)
+    if not campaign_dim:
+        log.info("ℹ️ campaign dimension vazia — executando job_campaigns_summary para preencher…")
+        job_campaigns_summary(advertiser_id, site_id)
+        campaign_dim = _load_campaign_dim(advertiser_id)
 
     rows: List[Dict[str, Any]] = []
-    for r in raw:
-        if not isinstance(r, dict):
-            continue
-        flat = _flatten_raw_daily(r)
 
-        # tenta preencher campaign_id pelo nome da campanha, se existir
-        if not flat.get("campaign_id") and flat.get("campaign_name"):
-            cid = name_to_id.get(str(flat["campaign_name"]).lower())
+    # Se não houver dimensão de ads, itera só por campanha
+    if not by_item and not by_ad:
+        log.warning("⚠️ Sem ads no summary; iterando por campanhas com filtro de campanha.")
+        camp_ids = list(campaign_dim.keys())
+        if not camp_ids:
+            log.warning("⚠️ Sem campanhas; abortando ads_daily.")
+            out_path = os.path.join(DATA_DIR, f"ads_daily_{advertiser_id}.csv")
+            write_csv_upsert_flexible(out_path, rows, key_fields=("advertiser_id", "ad_id", "item_id", "date"))
+            enviar_para_google_sheets(out_path, sheet="ads_daily")
+            return out_path
+        camp_chunks = [camp_ids[i:i+50] for i in range(0, len(camp_ids), 50)]
+        for cchunk in camp_chunks:
+            base_params = {
+                "date_from": date_from,
+                "date_to": date_to,
+                "metrics": ",".join([
+                    "clicks","prints","cost","cpc","acos",
+                    "organic_units_quantity","organic_units_amount","organic_items_quantity",
+                    "direct_items_quantity","indirect_items_quantity","advertising_items_quantity",
+                    "cvr","roas","sov",
+                    "direct_units_quantity","indirect_units_quantity","units_quantity",
+                    "direct_amount","indirect_amount","total_amount",
+                ]),
+                "aggregation_type": "DAILY",
+                "limit": 200,
+                "offset": 0,
+                "filters[campaign_ids]": ",".join(cchunk),
+            }
+            raw = search_all(base_endpoint, base_params, HDR_V2)
+            for r in raw:
+                flat = _flatten_raw_daily(r)
+                if not flat.get("date"):
+                    continue
+                cid = str(flat.get("campaign_id") or "").strip()
+                if cid and not flat.get("campaign_name"):
+                    flat["campaign_name"] = campaign_dim.get(cid, {}).get("name") or _fetch_campaign_name(site_id, cid)
+
+                # enriquecer por ad_id > item_id
+                aid = str(flat.get("ad_id") or "").strip()
+                iid = str(flat.get("item_id") or "").strip()
+                meta = (aid and by_ad.get(aid)) or (iid and by_item.get(iid)) or {}
+
+                if meta:
+                    flat.setdefault("ad_id", meta.get("ad_id", ""))
+                    flat.setdefault("item_id", meta.get("item_id", ""))
+                    if not flat.get("item_title"): flat["item_title"] = meta.get("item_title", "")
+                    if not flat.get("seller_sku"): flat["seller_sku"] = meta.get("seller_sku", "")
+                    if not flat.get("status"):     flat["status"]     = meta.get("status", "")
+
+                rows.append(_with_meta(flat, advertiser_id, site_id))
+    else:
+        # Mapa campanha -> itens a partir de by_item
+        camp_to_items: Dict[str, List[str]] = defaultdict(list)
+        for iid, meta in by_item.items():
+            cid = meta.get("campaign_id")
             if cid:
-                flat["campaign_id"] = cid
-                log.debug(f"↔️ campaign_id preenchido via summary (ads): {flat['campaign_name']} → {cid}")
+                camp_to_items[cid].append(iid)
+        for cid in list(campaign_dim.keys()):
+            camp_to_items.setdefault(cid, [])
 
-        # queremos pelo menos data e (idealmente) ad_id
-        if not flat.get("date"):
-            continue
+        for cid, items in camp_to_items.items():
+            if items:
+                for i in range(0, len(items), 100):
+                    item_chunk = items[i:i+100]
+                    params = {
+                        "date_from": date_from,
+                        "date_to": date_to,
+                        "metrics": ",".join([
+                            "clicks","prints","cost","cpc","acos",
+                            "organic_units_quantity","organic_units_amount","organic_items_quantity",
+                            "direct_items_quantity","indirect_items_quantity","advertising_items_quantity",
+                            "cvr","roas","sov",
+                            "direct_units_quantity","indirect_units_quantity","units_quantity",
+                            "direct_amount","indirect_amount","total_amount",
+                        ]),
+                        "aggregation_type": "DAILY",
+                        "limit": 200,
+                        "offset": 0,
+                        "filters[campaign_ids]": cid,
+                        "filters[item_ids]": ",".join(item_chunk),
+                    }
+                    page = meli_get(base_endpoint, params=params, headers=HDR_V2)
+                    data_results = page.get("results", []) if isinstance(page, dict) else (page or [])
+                    for r in data_results:
+                        if not isinstance(r, dict):
+                            continue
+                        flat = _flatten_raw_daily(r)
+                        if not flat.get("date"):
+                            continue
 
-        rows.append(_with_meta(flat, advertiser_id, site_id))
+                        # garantir campaign
+                        flat["campaign_id"] = flat.get("campaign_id") or cid
+                        if not flat.get("campaign_name"):
+                            flat["campaign_name"] = campaign_dim.get(cid, {}).get("name") or _fetch_campaign_name(site_id, cid)
+
+                        # enriquecer por ad_id (prioridade) e depois item_id
+                        aid = str(flat.get("ad_id") or "").strip()
+                        iid = str(flat.get("item_id") or "").strip()
+                        meta = (aid and by_ad.get(aid)) or (iid and by_item.get(iid)) or {}
+
+                        if meta:
+                            if not flat.get("ad_id"):       flat["ad_id"] = meta.get("ad_id", "")
+                            if not flat.get("item_id"):     flat["item_id"] = meta.get("item_id", "")
+                            if not flat.get("item_title"):  flat["item_title"] = meta.get("item_title", "")
+                            if not flat.get("seller_sku"):  flat["seller_sku"] = meta.get("seller_sku", "")
+                            if not flat.get("status"):      flat["status"] = meta.get("status", "")
+
+                        rows.append(_with_meta(flat, advertiser_id, site_id))
+            else:
+                params = {
+                    "date_from": date_from,
+                    "date_to": date_to,
+                    "metrics": ",".join([
+                        "clicks","prints","cost","cpc","acos",
+                        "organic_units_quantity","organic_units_amount","organic_items_quantity",
+                        "direct_items_quantity","indirect_items_quantity","advertising_items_quantity",
+                        "cvr","roas","sov",
+                        "direct_units_quantity","indirect_units_quantity","units_quantity",
+                        "direct_amount","indirect_amount","total_amount",
+                    ]),
+                    "aggregation_type": "DAILY",
+                    "limit": 200,
+                    "offset": 0,
+                    "filters[campaign_ids]": cid,
+                }
+                page = meli_get(base_endpoint, params=params, headers=HDR_V2)
+                data_results = page.get("results", []) if isinstance(page, dict) else (page or [])
+                for r in data_results:
+                    if not isinstance(r, dict):
+                        continue
+                    flat = _flatten_raw_daily(r)
+                    if not flat.get("date"):
+                        continue
+
+                    flat["campaign_id"] = flat.get("campaign_id") or cid
+                    if not flat.get("campaign_name"):
+                        flat["campaign_name"] = campaign_dim.get(cid, {}).get("name") or _fetch_campaign_name(site_id, cid)
+
+                    # enriquecer por ad_id (prioridade) e depois item_id
+                    aid = str(flat.get("ad_id") or "").strip()
+                    iid = str(flat.get("item_id") or "").strip()
+                    meta = (aid and by_ad.get(aid)) or (iid and by_item.get(iid)) or {}
+
+                    if meta:
+                        if not flat.get("ad_id"):       flat["ad_id"] = meta.get("ad_id", "")
+                        if not flat.get("item_id"):     flat["item_id"] = meta.get("item_id", "")
+                        if not flat.get("item_title"):  flat["item_title"] = meta.get("item_title", "")
+                        if not flat.get("seller_sku"):  flat["seller_sku"] = meta.get("seller_sku", "")
+                        if not flat.get("status"):      flat["status"] = meta.get("status", "")
+
+                    rows.append(_with_meta(flat, advertiser_id, site_id))
 
     out_path = os.path.join(DATA_DIR, f"ads_daily_{advertiser_id}.csv")
-    write_csv_upsert_flexible(out_path, rows, key_fields=("advertiser_id", "ad_id", "date"))
+    # chave inclui ad_id e item_id (e campaign_id + date) para estabilidade
+    write_csv_upsert_flexible(out_path, rows, key_fields=("advertiser_id", "campaign_id", "ad_id", "item_id", "date"))
     enviar_para_google_sheets(out_path, sheet="ads_daily")
     return out_path
 
@@ -358,31 +563,38 @@ def job_ads_summary(advertiser_id: str, site_id: str) -> str:
         out["item_id"] = item.get("id") or r.get("item_id") or out.get("item_id")
         out["item_title"] = item.get("title") or ad.get("title") or r.get("title") or out.get("item_title")
         out["seller_sku"] = item.get("seller_sku") or r.get("seller_sku") or out.get("seller_sku")
+        out["status"] = out.get("status") or ad.get("status") or camp.get("status")
         rows.append(_with_meta(out, advertiser_id, site_id))
 
     out_path = os.path.join(DATA_DIR, f"ads_summary_{advertiser_id}.csv")
-    write_csv_upsert_flexible(out_path, rows, key_fields=("advertiser_id", "ad_id"))
+    # chave inclui item_id para não colapsar linhas quando ad_id vier vazio
+    write_csv_upsert_flexible(out_path, rows, key_fields=("advertiser_id", "ad_id", "item_id"))
     enviar_para_google_sheets(out_path, sheet="ads_summary")
     return out_path
 
-
 # ---------------------------------------------------------------------
-# pipeline conveniente
+# pipeline — summaries + dailies
 # ---------------------------------------------------------------------
-def run_product_ads_pipeline(advertiser_id: str, site_id: str, backfill_days: int = 30) -> None:
-    end = date.today() - timedelta(days=1)
-    start = end - timedelta(days=max(1, backfill_days) - 1)
-    df, dt = start.isoformat(), end.isoformat()
+def run_product_ads_pipeline(advertiser_id: str, site_id: str, backfill_days: int = 30, date_from: Optional[str] = None, date_to: Optional[str] = None) -> None:
+    if date_from and date_to:
+        df, dt = date_from, date_to
+    else:
+        end = date.today() - timedelta(days=1)
+        start = end - timedelta(days=max(1, backfill_days) - 1)
+        df, dt = start.isoformat(), end.isoformat()
 
     log.info(f"🏃 Product Ads (orig metrics) {df} → {dt}")
-    p1 = job_campaigns_daily(advertiser_id, site_id, df, dt)
-    p2 = job_ads_daily(advertiser_id, site_id, df, dt)
+
     p3 = job_campaigns_summary(advertiser_id, site_id)
     p4 = job_ads_summary(advertiser_id, site_id)
-    log.info(f"✔ campaign_daily → {p1}")
-    log.info(f"✔ ads_daily → {p2}")
+
+    p1 = job_campaigns_daily(advertiser_id, site_id, df, dt)
+    p2 = job_ads_daily(advertiser_id, site_id, df, dt)
+
     log.info(f"✔ campaign_summary → {p3}")
     log.info(f"✔ ads_summary → {p4}")
+    log.info(f"✔ campaign_daily → {p1}")
+    log.info(f"✔ ads_daily → {p2}")
 
 
 if __name__ == "__main__":
