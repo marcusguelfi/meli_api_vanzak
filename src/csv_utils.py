@@ -33,7 +33,6 @@ class _FileLock:
         start = time.time()
         while True:
             try:
-                # os.O_EXCL garante exclusividade na criação
                 fd = os.open(self.lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
                 os.close(fd)
                 self.acquired = True
@@ -58,17 +57,13 @@ def upsert_csv(
     rows: Iterable[Dict[str, Any]],
     key_fields: Iterable[str],
     *,
-    # Se informado, congela o header nesta ordem (colunas fora do schema são ignoradas).
     schema: Optional[List[str]] = None,
-    # Quando schema não for informado:
-    # - True  -> permite adicionar novas colunas (união de colunas)
-    # - False -> mantém exatamente o header atual do arquivo; ignora colunas novas
     allow_new_columns: bool = False,
-    # Ordenar as linhas antes de gravar; ex.: lambda r: (r["seller_id"], r["campaign_id"], r["date"])
     sort_key: Optional[Callable[[Dict[str, Any]], Any]] = None,
-    # Ativar lock e escrita atômica (tmp + rename)
     atomic: bool = True,
     lock_timeout_s: float = 30.0,
+    drop_fields: Optional[Iterable[str]] = None,      # novo
+    strict_header: bool = False,                      # novo
 ) -> str:
     """
     Upsert idempotente em um CSV fixo.
@@ -85,7 +80,6 @@ def upsert_csv(
     path = str(path)
     _ensure_parent(path)
 
-    # lock (best-effort) para evitar escrita concorrente
     lock_ctx = _FileLock(path, timeout_s=lock_timeout_s) if atomic else None
     if lock_ctx:
         lock_ctx.__enter__()
@@ -107,22 +101,18 @@ def upsert_csv(
 
         # 2) definir header alvo
         if schema:
-            header = list(schema)  # congela ordem
+            header = list(schema)
         else:
             if not header:
-                # arquivo não existe (ou vazio): derive do 1º row
                 rows_iter = iter(rows)
                 boot_rows = list(rows_iter)
                 if not boot_rows:
-                    # nada a fazer
                     return path
                 first = boot_rows[0]
                 header = list(first.keys())
-                # reusa a lista que já materializamos
                 rows = boot_rows
 
             if allow_new_columns:
-                # união de colunas novas (ordem: existentes + novas por chegada)
                 seen = set(header)
                 def _union_cols(cols: Iterable[str]):
                     nonlocal header, seen
@@ -131,43 +121,50 @@ def upsert_csv(
                             seen.add(c)
                             header.append(c)
             else:
-                # trava no header atual (colunas fora serão ignoradas)
-                def _union_cols(cols: Iterable[str]):  # no-op
+                def _union_cols(cols: Iterable[str]):
                     return
 
         # 3) aplicar upserts
         incoming_list = list(rows)
         if not schema and allow_new_columns:
-            # expande header conforme as linhas novas
             for row in incoming_list:
                 _union_cols(row.keys())
 
         for row in incoming_list:
             k = _row_key(row, key_fields)
             if k in idx:
-                # atualiza somente colunas conhecidas
-                if schema or not allow_new_columns:
-                    for c in header:
-                        val = row.get(c, None)
-                        if val not in ("", None):
-                            existing[idx[k]][c] = val
-                else:
-                    # união já feita, pode atualizar tudo que estiver no header
-                    for c in header:
-                        val = row.get(c, None)
-                        if val not in ("", None):
-                            existing[idx[k]][c] = val
+                for c in header:
+                    val = row.get(c, None)
+                    if val not in ("", None):
+                        existing[idx[k]][c] = val
             else:
-                # nova linha: respeita header
                 new_row = {c: row.get(c, "") for c in header}
                 idx[k] = len(existing)
                 existing.append(new_row)
 
-        # 4) ordenar (opcional)
+        # 4) drop_fields opcional
+        if drop_fields:
+            drop_fields = tuple(drop_fields)
+            for row in existing:
+                for f in drop_fields:
+                    row.pop(f, None)
+
+        # 5) header estrito
+        if strict_header and not schema:
+            keys = []
+            seen = set()
+            for row in existing:
+                for k in row.keys():
+                    if k not in seen:
+                        seen.add(k)
+                        keys.append(k)
+            header = keys
+
+        # 6) ordenar
         if sort_key:
             existing.sort(key=sort_key)
 
-        # 5) escrita atômica
+        # 7) escrita
         if atomic:
             fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path) + "_", suffix=".tmp")
             os.close(fd)

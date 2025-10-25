@@ -1,31 +1,67 @@
+# src/cleanup_csvs.py
+from __future__ import annotations
 import os
+import logging
+from pathlib import Path
+from typing import Sequence
 
-folder = "data/processed"
+FOLDER = Path("data/processed")
 
-# lista todos os CSVs no diretório
-csv_files = [f for f in os.listdir(folder) if f.endswith(".csv")]
+# nomes base (sem timestamp) que devem ser preservados
+KEEP_DEFAULT = {
+    "ads_daily.csv",
+    "campaign_daily.csv",
+    "orders_items_daily.csv",
+    "ads_summary.csv",
+    "campaign_summary.csv",
+}
 
-print("📂 CSVs encontrados:")
-for f in csv_files:
-    print(" -", f)
+LOG_FMT = "%(asctime)s | %(levelname)s | %(message)s"
+logging.basicConfig(level=logging.INFO, format=LOG_FMT)
+log = logging.getLogger("cleanup_csvs")
 
-# define os que você quer manter (os com M)
-keep = {"ads_daily.csv", "campaigns_daily.csv", "orders_items_daily.csv"}
+def cleanup_csvs(folder: Path = FOLDER, keep: Sequence[str] | None = None, dry_run: bool = False) -> int:
+    """
+    Remove CSVs antigos do diretório 'data/processed', mantendo apenas os especificados.
+    Retorna o número de arquivos removidos.
+    """
+    keep = set(keep or KEEP_DEFAULT)
+    if not folder.exists():
+        log.warning("📁 Pasta %s não existe — nada a fazer.", folder)
+        return 0
 
-to_delete = [f for f in csv_files if f not in keep]
+    csv_files = [p for p in folder.glob("*.csv")]
+    log.info("📦 Encontrados %d CSVs.", len(csv_files))
 
-print("\n🧹 Candidatos à exclusão:")
-for f in to_delete:
-    print(" -", f)
+    to_delete = [p for p in csv_files if p.name not in keep]
+    if not to_delete:
+        log.info("✅ Nenhum arquivo fora da lista KEEP.")
+        return 0
 
-confirm = input("\nDeseja apagar esses arquivos? (s/n): ").strip().lower()
-if confirm == "s":
-    for f in to_delete:
-        path = os.path.join(folder, f)
+    log.info("🧹 Candidatos à exclusão (%d):", len(to_delete))
+    for p in to_delete:
+        log.info("  - %s", p.name)
+
+    if dry_run:
+        log.info("🧪 dry-run: nada foi removido.")
+        return 0
+
+    confirm = input("\n⚠️ Confirmar remoção? (s/n): ").strip().lower()
+    if confirm not in {"s", "sim"}:
+        log.info("🚫 Cancelado pelo usuário.")
+        return 0
+
+    removed = 0
+    for p in to_delete:
         try:
-            os.remove(path)
-            print(f"✅ Removido: {f}")
+            p.unlink(missing_ok=True)
+            removed += 1
+            log.warning("  ❌ removido: %s", p.name)
         except Exception as e:
-            print(f"⚠️ Erro ao remover {f}: {e}")
-else:
-    print("❌ Nenhum arquivo removido.")
+            log.error("⚠️ Erro ao remover %s: %s", p.name, e)
+
+    log.info("✅ Limpeza concluída. %d arquivo(s) removido(s).", removed)
+    return removed
+
+if __name__ == "__main__":
+    cleanup_csvs()

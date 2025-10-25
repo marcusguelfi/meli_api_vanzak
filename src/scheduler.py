@@ -59,8 +59,10 @@ RUN_ORDERS_JOB = os.getenv("RUN_ORDERS_JOB", "false").lower() in ("1", "true", "
 
 ADVERTISER_ID = os.getenv("ADVERTISER_ID", "731958")
 SITE_ID = os.getenv("SITE_ID", "MLB")
-DATE_FROM = os.getenv("DATE_FROM", "2025-10-01")
-DATE_TO = os.getenv("DATE_TO", "2025-10-15")
+from datetime import date, timedelta
+DATE_TO = date.today().isoformat()
+DATE_FROM = (date.today() - timedelta(days=1)).isoformat()
+
 
 # Limpeza automática do data/raw
 ENABLE_RAW_CLEANUP = os.getenv("ENABLE_RAW_CLEANUP", "true").lower() in ("1", "true", "yes")
@@ -141,7 +143,7 @@ def main():
     run_all_jobs()  # roda imediatamente
 
     scheduler = BlockingScheduler(timezone="America/Sao_Paulo")
-    scheduler.add_job(run_all_jobs, "interval", hours=1, next_run_time=None)
+    scheduler.add_job(run_all_jobs, "interval", hours=1, coalesce=True, max_instances=1)
     scheduler.start()
 
 if __name__ == "__main__":
