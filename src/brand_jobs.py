@@ -22,60 +22,57 @@ from .meli_client import meli_get
 # Se quiser isolar métricas de Brand Ads, troque aqui:
 METRICS_DAILY_BRAND = METRICS_DAILY
 
-# Cache do "base path" válido para Brand Ads por advertiser
-# Ex.: "/advertising/advertisers/{advertiser_id}/brand_ads"
+# Cache do "base path" válido para Brand Ads por brand
+# Ex.: "/advertising/brands/{brand_id}"
 _brand_base_cache: Dict[str, str] = {}
 
 
-def _candidate_bases(advertiser_id: str, site_id: str) -> List[str]:
+# ---------------------------------------------------------------------
+# Resolvedor de base path (Brand Ads)
+# ---------------------------------------------------------------------
+def _candidate_bases(brand_id: str, site_id: str) -> List[str]:
     """
     Tenta em ordem:
-      1) /advertising/advertisers/{advertiser_id}/brand_ads
-      2) /advertising/advertisers/{advertiser_id}/brands_ads          (plural)
-      3) /advertising/{site_id}/advertisers/{advertiser_id}/brand_ads
-      4) /advertising/{site_id}/advertisers/{advertiser_id}/brands_ads (plural)
+      1) /advertising/brands/{brand_id}
+      2) /advertising/{site_id}/brands/{brand_id} (fallback)
     """
     return [
-        f"/advertising/advertisers/{advertiser_id}/brand_ads",
-        f"/advertising/advertisers/{advertiser_id}/brands_ads",
-        f"/advertising/{site_id}/advertisers/{advertiser_id}/brand_ads",
-        f"/advertising/{site_id}/advertisers/{advertiser_id}/brands_ads",
+        f"/advertising/brands/{brand_id}",
+        f"/advertising/{site_id}/brands/{brand_id}",
     ]
 
 
-def _resolve_brand_base(advertiser_id: str, site_id: str) -> str:
+def _resolve_brand_base(brand_id: str, site_id: str) -> str:
     """
     Descobre e cacheia qual base path de Brand Ads funciona no tenant.
     Faz um GET leve em /campaigns/search?limit=1 para testar.
     """
-    key = f"{site_id}:{advertiser_id}"
+    key = f"{site_id}:{brand_id}"
     if key in _brand_base_cache:
         return _brand_base_cache[key]
 
-    for base in _candidate_bases(advertiser_id, site_id):
+    for base in _candidate_bases(brand_id, site_id):
         test_ep = f"{base}/campaigns/search"
         try:
             log.info("➡️ Testando base de Brand Ads: %s", test_ep)
             _ = meli_get(test_ep, params={"limit": 1}, headers=HDR_V2)
-            # Se não lança exceção, funcionou
             _brand_base_cache[key] = base
             log.info("✅ Base Brand Ads selecionada: %s", base)
             return base
         except HTTPError as e:
             status = getattr(e.response, "status_code", None)
-            # Só troca de base em 400/404; outros erros interrompem
             if status not in (400, 404):
                 raise
             log.info("… base %s não disponível (status %s), tentando próxima…", base, status)
 
-    raise RuntimeError("Nenhum endpoint de Brand Ads funcionou neste tenant (testadas 4 variações).")
+    raise RuntimeError("Nenhum endpoint de Brand Ads funcionou neste tenant (testadas 2 variações).")
 
 
-def _brand_search_all(advertiser_id: str, site_id: str, suffix: str, params: Dict[str, Any]) -> List[Dict[str, Any]]:
+def _brand_search_all(brand_id: str, site_id: str, suffix: str, params: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
     Paginação usando a base resolvida dinamicamente.
     """
-    base = _resolve_brand_base(advertiser_id, site_id)
+    base = _resolve_brand_base(brand_id, site_id)
     out: List[Dict[str, Any]] = []
     limit = int(params.get("limit", 200))
     offset = 0
@@ -96,8 +93,8 @@ def _brand_search_all(advertiser_id: str, site_id: str, suffix: str, params: Dic
 # ---------------------------------------------------------------------
 # Dimensões (Brand)
 # ---------------------------------------------------------------------
-def _load_brand_campaign_dim(advertiser_id: str) -> Dict[str, Dict[str, str]]:
-    path = os.path.join(PROCESSED_DIR, f"brand_campaign_summary_{advertiser_id}.csv")
+def _load_brand_campaign_dim(brand_id: str) -> Dict[str, Dict[str, str]]:
+    path = os.path.join(PROCESSED_DIR, f"brand_campaign_summary_{brand_id}.csv")
     _, rows = _read_csv(path)
     dim: Dict[str, Dict[str, str]] = {}
     for r in rows:
@@ -108,8 +105,8 @@ def _load_brand_campaign_dim(advertiser_id: str) -> Dict[str, Dict[str, str]]:
     return dim
 
 
-def _load_brand_ads_dim_maps(advertiser_id: str) -> Tuple[Dict[str, Dict[str, str]], Dict[str, Dict[str, str]]]:
-    path = os.path.join(PROCESSED_DIR, f"brand_ads_summary_{advertiser_id}.csv")
+def _load_brand_ads_dim_maps(brand_id: str) -> Tuple[Dict[str, Dict[str, str]], Dict[str, Dict[str, str]]]:
+    path = os.path.join(PROCESSED_DIR, f"brand_ads_summary_{brand_id}.csv")
     _, rows = _read_csv(path)
     by_item: Dict[str, Dict[str, str]] = {}
     by_ad: Dict[str, Dict[str, str]] = {}
@@ -134,12 +131,12 @@ def _load_brand_ads_dim_maps(advertiser_id: str) -> Tuple[Dict[str, Dict[str, st
 # ---------------------------------------------------------------------
 # SUMMARY (Brand)
 # ---------------------------------------------------------------------
-def job_brand_campaigns_summary(advertiser_id: str, site_id: str) -> str:
+def job_brand_campaigns_summary(brand_id: str, site_id: str) -> str:
     """
     Summary de campanhas (Brand Ads).
     """
     rows: List[Dict[str, Any]] = []
-    data = _brand_search_all(advertiser_id, site_id, "/campaigns/search", {"limit": 200})
+    data = _brand_search_all(brand_id, site_id, "/campaigns/search", {"limit": 200})
 
     for r in data or []:
         if not isinstance(r, dict):
@@ -149,26 +146,26 @@ def job_brand_campaigns_summary(advertiser_id: str, site_id: str) -> str:
         out["campaign_id"] = camp.get("id") or r.get("campaign_id") or out.get("campaign_id")
         out["campaign_name"] = camp.get("name") or r.get("campaign_name") or out.get("campaign_name")
         out["status"] = out.get("status") or camp.get("status")
-        rows.append(_with_meta(out, advertiser_id, site_id))
+        rows.append(_with_meta(out, brand_id, site_id))
 
-    out_path = os.path.join(PROCESSED_DIR, f"brand_campaign_summary_{advertiser_id}.csv")
+    out_path = os.path.join(PROCESSED_DIR, f"brand_campaign_summary_{brand_id}.csv")
     write_csv_upsert_flexible(
         out_path, rows,
         key_fields=("advertiser_id", "campaign_id"),
         sort_by=("advertiser_id", "campaign_id"),
         reset_file=RESET_CSVS,
-        fallback_header=("advertiser_id","site_id","campaign_id","campaign_name","status"),
+        fallback_header=("advertiser_id", "site_id", "campaign_id", "campaign_name", "status"),
     )
     enviar_para_google_sheets(out_path, sheet="brand_campaign_summary")
     return out_path
 
 
-def job_brand_ads_summary(advertiser_id: str, site_id: str) -> str:
+def job_brand_ads_summary(brand_id: str, site_id: str) -> str:
     """
     Summary de ads (Brand Ads).
     """
     rows: List[Dict[str, Any]] = []
-    data = _brand_search_all(advertiser_id, site_id, "/ads/search", {"limit": 200})
+    data = _brand_search_all(brand_id, site_id, "/ads/search", {"limit": 200})
 
     for r in data or []:
         if not isinstance(r, dict):
@@ -184,15 +181,15 @@ def job_brand_ads_summary(advertiser_id: str, site_id: str) -> str:
         out["item_title"] = item.get("title") or ad.get("title") or r.get("title") or out.get("item_title")
         out["seller_sku"] = item.get("seller_sku") or r.get("seller_sku") or out.get("seller_sku")
         out["status"] = out.get("status") or ad.get("status") or camp.get("status")
-        rows.append(_with_meta(out, advertiser_id, site_id))
+        rows.append(_with_meta(out, brand_id, site_id))
 
-    out_path = os.path.join(PROCESSED_DIR, f"brand_ads_summary_{advertiser_id}.csv")
+    out_path = os.path.join(PROCESSED_DIR, f"brand_ads_summary_{brand_id}.csv")
     write_csv_upsert_flexible(
         out_path, rows,
         key_fields=("advertiser_id", "ad_id", "item_id"),
         sort_by=("advertiser_id", "campaign_id", "ad_id", "item_id"),
         reset_file=RESET_CSVS,
-        fallback_header=("advertiser_id","site_id","campaign_id","ad_id","item_id","item_title","seller_sku","status"),
+        fallback_header=("advertiser_id", "site_id", "campaign_id", "ad_id", "item_id", "item_title", "seller_sku", "status"),
     )
     enviar_para_google_sheets(out_path, sheet="brand_ads_summary")
     return out_path
@@ -201,18 +198,18 @@ def job_brand_ads_summary(advertiser_id: str, site_id: str) -> str:
 # ---------------------------------------------------------------------
 # DAILY (Brand)
 # ---------------------------------------------------------------------
-def job_brand_campaigns_daily(advertiser_id: str, site_id: str, date_from: str, date_to: str) -> str:
+def job_brand_campaigns_daily(brand_id: str, site_id: str, date_from: str, date_to: str) -> str:
     """
     Métricas diárias de campanhas (Brand Ads).
     """
-    dim = _load_brand_campaign_dim(advertiser_id)
+    dim = _load_brand_campaign_dim(brand_id)
     if not dim:
         log.info("ℹ️ brand campaign dimension vazia — preenchendo via summary…")
-        job_brand_campaigns_summary(advertiser_id, site_id)
-        dim = _load_brand_campaign_dim(advertiser_id)
+        job_brand_campaigns_summary(brand_id, site_id)
+        dim = _load_brand_campaign_dim(brand_id)
     if not dim:
         log.warning("⚠️ Sem campanhas de Brand; abortando brand_campaign_daily.")
-        return os.path.join(PROCESSED_DIR, f"brand_campaign_daily_{advertiser_id}.csv")
+        return os.path.join(PROCESSED_DIR, f"brand_campaign_daily_{brand_id}.csv")
 
     ids = list(dim.keys())
     CHUNK = 50
@@ -220,7 +217,7 @@ def job_brand_campaigns_daily(advertiser_id: str, site_id: str, date_from: str, 
 
     metrics = ",".join(METRICS_DAILY_BRAND)
     for i in range(0, len(ids), CHUNK):
-        chunk = ids[i:i+CHUNK]
+        chunk = ids[i:i + CHUNK]
         params = {
             "date_from": date_from,
             "date_to": date_to,
@@ -229,7 +226,7 @@ def job_brand_campaigns_daily(advertiser_id: str, site_id: str, date_from: str, 
             "limit": 200,
             "filters[campaign_ids]": ",".join(chunk),
         }
-        data = _brand_search_all(advertiser_id, site_id, "/campaigns/search", params)
+        data = _brand_search_all(brand_id, site_id, "/campaigns/search", params)
         for r in data or []:
             if not isinstance(r, dict):
                 continue
@@ -246,9 +243,9 @@ def job_brand_campaigns_daily(advertiser_id: str, site_id: str, date_from: str, 
 
             flat["campaign_id"] = cid or flat.get("campaign_id")
             flat["campaign_name"] = cname or flat.get("campaign_name")
-            rows.append(_with_meta(flat, advertiser_id, site_id))
+            rows.append(_with_meta(flat, brand_id, site_id))
 
-    out_path = os.path.join(PROCESSED_DIR, f"brand_campaign_daily_{advertiser_id}.csv")
+    out_path = os.path.join(PROCESSED_DIR, f"brand_campaign_daily_{brand_id}.csv")
     write_csv_upsert_flexible(
         out_path, rows,
         key_fields=("advertiser_id", "campaign_id", "date"),
@@ -256,19 +253,17 @@ def job_brand_campaigns_daily(advertiser_id: str, site_id: str, date_from: str, 
         drop_fields=("ad_id", "item_id", "item_title", "seller_sku", "status"),
         sort_by=("advertiser_id", "campaign_id", "date"),
         reset_file=RESET_CSVS,
-        fallback_header=("advertiser_id","site_id","date","campaign_id","campaign_name", *METRICS_DAILY_BRAND),
+        fallback_header=("advertiser_id", "site_id", "date", "campaign_id", "campaign_name", *METRICS_DAILY_BRAND),
     )
     enviar_para_google_sheets(out_path, sheet="brand_campaign_daily")
     return out_path
 
 
-def job_brand_ads_daily(advertiser_id: str, site_id: str, date_from: str, date_to: str) -> str:
+def job_brand_ads_daily(brand_id: str, site_id: str, date_from: str, date_to: str) -> str:
     """
     Métricas diárias de ads (Brand Ads) por campanha.
-    Mantém linhas mesmo se a API não devolver ad_id/item_id; enriquece quando possível.
     """
-    # tentar resolver base antes — evita 404 repetido e dá log claro
-    _ = _resolve_brand_base(advertiser_id, site_id)
+    _ = _resolve_brand_base(brand_id, site_id)
 
     rows: List[Dict[str, Any]] = []
     base_params = {
@@ -279,15 +274,14 @@ def job_brand_ads_daily(advertiser_id: str, site_id: str, date_from: str, date_t
         "limit": 200,
     }
 
-    # Sem depender de summary/ads: iteramos por campanha a partir do summary de brand
-    dim = _load_brand_campaign_dim(advertiser_id)
+    dim = _load_brand_campaign_dim(brand_id)
     if not dim:
-        job_brand_campaigns_summary(advertiser_id, site_id)
-        dim = _load_brand_campaign_dim(advertiser_id)
+        job_brand_campaigns_summary(brand_id, site_id)
+        dim = _load_brand_campaign_dim(brand_id)
 
     for cid in dim.keys():
         params = {**base_params, "filters[campaign_id]": cid}
-        data = _brand_search_all(advertiser_id, site_id, "/ads/search", params)
+        data = _brand_search_all(brand_id, site_id, "/ads/search", params)
         for r in (data or []):
             if not isinstance(r, dict):
                 continue
@@ -296,20 +290,18 @@ def job_brand_ads_daily(advertiser_id: str, site_id: str, date_from: str, date_t
                 continue
             flat["campaign_id"] = flat.get("campaign_id") or cid
             flat["campaign_name"] = flat.get("campaign_name") or dim.get(cid, {}).get("name", "")
-            rows.append(_with_meta(flat, advertiser_id, site_id))
+            rows.append(_with_meta(flat, brand_id, site_id))
 
-    # RAW completo
-    out_path_raw = os.path.join(RAW_DIR, f"brand_ads_daily_{advertiser_id}.csv")
+    out_path_raw = os.path.join(RAW_DIR, f"brand_ads_daily_{brand_id}.csv")
     write_csv_upsert_flexible(
         out_path_raw, rows,
         key_fields=("advertiser_id", "campaign_id", "ad_id", "item_id", "date"),
         sort_by=("advertiser_id", "campaign_id", "date", "ad_id", "item_id"),
         reset_file=RESET_CSVS,
-        fallback_header=("advertiser_id","site_id","date","campaign_id","campaign_name",
-                         "ad_id","item_id","item_title","seller_sku","status", *METRICS_DAILY_BRAND),
+        fallback_header=("advertiser_id", "site_id", "date", "campaign_id", "campaign_name",
+                         "ad_id", "item_id", "item_title", "seller_sku", "status", *METRICS_DAILY_BRAND),
     )
 
-    # PROCESSED: promove mantendo ordenação por data
     return _promote_to_processed(
         out_path_raw, "brand_ads_daily",
         ("advertiser_id", "campaign_id", "ad_id", "item_id", "date"),
@@ -320,22 +312,22 @@ def job_brand_ads_daily(advertiser_id: str, site_id: str, date_from: str, date_t
 # ---------------------------------------------------------------------
 # Runner (Brand Ads)
 # ---------------------------------------------------------------------
-def run_brand_ads_pipeline(advertiser_id: str, site_id: str, backfill_days: int = 30,
+def run_brand_ads_pipeline(brand_id: str, site_id: str, backfill_days: int = 30,
                            date_from: Optional[str] = None, date_to: Optional[str] = None) -> None:
     if date_from and date_to:
         df, dt = date_from, date_to
     else:
-        end = date.today() - timedelta(days=1)               # fecha em D-1
+        end = date.today() - timedelta(days=1)
         start = end - timedelta(days=max(1, backfill_days) - 1)
         df, dt = start.isoformat(), end.isoformat()
 
+    log.info("🚀 Iniciando pipeline Brand Ads para brand_id=%s (site=%s)", brand_id, site_id)
     log.info("🏃 Brand Ads %s → %s", df, dt)
 
-    p3 = job_brand_campaigns_summary(advertiser_id, site_id)
-    p4 = job_brand_ads_summary(advertiser_id, site_id)
-
-    p1 = job_brand_campaigns_daily(advertiser_id, site_id, df, dt)
-    p2 = job_brand_ads_daily(advertiser_id, site_id, df, dt)
+    p3 = job_brand_campaigns_summary(brand_id, site_id)
+    p4 = job_brand_ads_summary(brand_id, site_id)
+    p1 = job_brand_campaigns_daily(brand_id, site_id, df, dt)
+    p2 = job_brand_ads_daily(brand_id, site_id, df, dt)
 
     log.info("✔ brand_campaign_summary → %s", p3)
     log.info("✔ brand_ads_summary → %s", p4)
@@ -344,9 +336,9 @@ def run_brand_ads_pipeline(advertiser_id: str, site_id: str, backfill_days: int 
 
 
 if __name__ == "__main__":
-    adv = os.getenv("ADVERTISER_ID", "").strip()
+    brand = os.getenv("BRAND_ID", "").strip()
     site = os.getenv("SITE_ID", "MLB").strip()
     backfill_days = int(os.getenv("BACKFILL_DAYS", "30"))
-    if not adv:
-        raise SystemExit("Defina ADVERTISER_ID no ambiente.")
-    run_brand_ads_pipeline(adv, site, backfill_days)
+    if not brand:
+        raise SystemExit("Defina BRAND_ID no ambiente.")
+    run_brand_ads_pipeline(brand, site, backfill_days)

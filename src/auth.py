@@ -15,9 +15,14 @@ from .config import ML_CLIENT_ID, ML_CLIENT_SECRET, ML_REDIRECT_URI
 # Constantes OAuth
 AUTH_BASE_URL = "https://auth.mercadolibre.com/authorization"
 TOKEN_URL = "https://api.mercadolibre.com/oauth/token"
+
+# Escopos atualizados — inclui Advertising (Brand Ads)
 SCOPE = (
     "offline_access "
+    "read:advertising "
+    "manage:advertising "
     "read "
+    "write "
     "urn:ml:mktp:ads:/read-write "
     "urn:ml:mktp:orders-shipments:/read-write "
     "urn:ml:mktp:publish-sync:/read-write "
@@ -25,7 +30,6 @@ SCOPE = (
     "urn:ml:mktp:metrics:/read-only "
     "urn:ml:mktp:invoices:/read-write "
     "urn:ml:mktp:comunication:/read-write "
-    "write"
 )
 
 # Caminho único do tokens.json (sempre dentro de src/)
@@ -62,7 +66,7 @@ def get_auth_url(state: str = "meli_state") -> str:
         "redirect_uri": ML_REDIRECT_URI,
         "state": state,
         # escopo é opcional na tela de consentimento do ML; mantemos aqui por clareza
-        # "scope": SCOPE,
+        "scope": SCOPE,
     }
     return f"{AUTH_BASE_URL}?{urlencode(params)}"
 
@@ -81,6 +85,7 @@ def exchange_code_for_token(authorization_code: str) -> Dict[str, Any]:
         "client_secret": ML_CLIENT_SECRET,
         "code": authorization_code,
         "redirect_uri": ML_REDIRECT_URI,
+        "scope": SCOPE,  # <-- incluído explicitamente para garantir escopos de advertising
     }
     logging.info("🔐 Solicitando troca de authorization_code por tokens...")
     resp = requests.post(TOKEN_URL, data=data, timeout=60)
@@ -186,3 +191,15 @@ def get_access_token() -> str:
         return refresh_access_token(tokens.get("refresh_token"))["access_token"]
 
     return tokens["access_token"]
+
+
+# ---------------------------
+# Utilitário opcional para debug
+# ---------------------------
+def debug_token_info() -> None:
+    """Mostra scopes e validade do token atual."""
+    token = get_access_token()
+    info = requests.get(f"https://api.mercadolibre.com/oauth/token/info?access_token={token}").json()
+    logging.info("🔎 Token user_id=%s", info.get("user_id"))
+    logging.info("👀 Scopes: %s", info.get("scope"))
+    logging.info("🕐 Expira em (segundos): %s", info.get("expires_in"))

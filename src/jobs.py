@@ -471,13 +471,14 @@ def job_ads_daily(advertiser_id: str, site_id: str, date_from: str, date_to: str
     """
     DAILY de Ads via:
       /advertising/{site_id}/advertisers/{advertiser_id}/product_ads/ads/search
-    Estratégia:
-      - por campanha, usando filters[campaign_id] (singular) + aggregation_type=DAILY
-      - mantém linhas mesmo sem ad_id/item_id; enriquece via summaries quando possível
+
+    Estrutura simplificada:
+      - Apenas campaign_id e item_id como chaves de identificação
+      - Sem enrichment (ad_id, item_title, seller_sku, status ficam no summary)
+      - Mantém todas as métricas de performance
     """
     endpoint = f"/advertising/{site_id}/advertisers/{advertiser_id}/product_ads/ads/search"
 
-    by_item, by_ad = _load_ads_dim_maps(advertiser_id)
     campaign_dim = _load_campaign_dim(advertiser_id)
     if not campaign_dim:
         log.info("ℹ️ campaign dimension vazia — preenchendo via summary…")
@@ -494,49 +495,51 @@ def job_ads_daily(advertiser_id: str, site_id: str, date_from: str, date_to: str
     }
 
     for cid in campaign_dim.keys():
-        params = {**base_params, "filters[campaign_id]": cid}  # singular
+        params = {**base_params, "filters[campaign_id]": cid}
         data = search_all(endpoint, params, HDR_V2)
         for r in (data or []):
             if not isinstance(r, dict):
                 continue
+
             flat = _flatten_raw_daily(r)
             if not flat.get("date"):
                 continue
 
-            # amarra campanha e nome
-            flat["campaign_id"] = flat.get("campaign_id") or cid
-            if not flat.get("campaign_name"):
-                flat["campaign_name"] = campaign_dim.get(cid, {}).get("name") or _fetch_campaign_name(site_id, cid)
+            # mantemos apenas campaign_id, item_id e métricas
+            filtered = {
+                "advertiser_id": advertiser_id,
+                "site_id": site_id,
+                "date": flat.get("date"),
+                "campaign_id": flat.get("campaign_id") or cid,
+                "item_id": flat.get("item_id") or "",
+            }
 
-            # enriquecimento quando possível
-            aid = str(flat.get("ad_id") or "").strip()
-            iid = str(flat.get("item_id") or "").strip()
-            meta = (aid and by_ad.get(aid)) or (iid and by_item.get(iid)) or {}
-            if meta:
-                flat.setdefault("ad_id", meta.get("ad_id", ""))
-                flat.setdefault("item_id", meta.get("item_id", ""))
-                if not flat.get("item_title"): flat["item_title"] = meta.get("item_title", "")
-                if not flat.get("seller_sku"): flat["seller_sku"] = meta.get("seller_sku", "")
-                if not flat.get("status"):     flat["status"]     = meta.get("status", "")
+            # adiciona todas as métricas disponíveis
+            for m in METRICS_DAILY:
+                if m in flat:
+                    filtered[m] = flat[m]
 
-            rows.append(_with_meta(flat, advertiser_id, site_id))
+            rows.append(filtered)
 
-    # grava RAW e promove (leniente)
+    # grava RAW simplificado
     out_path_raw = os.path.join(RAW_DIR, f"ads_daily_{advertiser_id}.csv")
     write_csv_upsert_flexible(
         out_path_raw,
         rows,
-        key_fields=("advertiser_id", "campaign_id", "ad_id", "item_id", "date"),
-        sort_by=("advertiser_id", "campaign_id", "date", "ad_id", "item_id"),
+        key_fields=("advertiser_id", "campaign_id", "item_id", "date"),
+        sort_by=("advertiser_id", "campaign_id", "item_id", "date"),
         reset_file=RESET_CSVS,
-        fallback_header=("advertiser_id","site_id","date","campaign_id","campaign_name",
-                         "ad_id","item_id","item_title","seller_sku","status", *METRICS_DAILY),
+        fallback_header=("advertiser_id", "site_id", "date", "campaign_id", "item_id", *METRICS_DAILY),
     )
 
-    log.info("📈 ads_daily: total de linhas para %s = %d", advertiser_id, len(rows))
-    return _promote_to_processed(out_path_raw, "ads_daily",
-                                 ("advertiser_id", "campaign_id", "ad_id", "item_id", "date"),
-                                 ensure_date_sorted=True)
+    log.info("📊 ads_daily (simplificado): total de linhas para %s = %d", advertiser_id, len(rows))
+
+    # promove RAW → PROCESSED
+    return _promote_to_processed(
+        out_path_raw, "ads_daily",
+        ("advertiser_id", "campaign_id", "item_id", "date"),
+        ensure_date_sorted=True,
+    )
 
 # ---------------------------------------------------------------------
 # Pipeline principal (range com backfill de N dias; default termina em D-1)
